@@ -1,0 +1,19 @@
+{
+  "name": "earn-smart-contracts",
+  "version": "1.0.0",
+  "description": "YieldRebalancer smart contracts — non-custodial yield optimiser for Morpho and Aave V3",
+  "type": "commonjs",
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "hardhat compile",
+    "clean": "hardhat clean"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomicfoundation/hardhat-viem": "^2.0.0",
+    "chai": "^4.3.0",
+    "hardhat": "^2.22.0",
+    "viem": "^2.0.0"
+  }
+}

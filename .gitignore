@@ -1,0 +1,7 @@
+node_modules/
+out/
+cache/
+artifacts/
+lib/
+.env
+typechain-types/
