@@ -60,35 +60,35 @@ Setting `destinationCaller = address(this)` (as bytes32) at burn time on the sou
 
 ### Owner-only
 
-| Function | Description |
-|---|---|
-| `deposit(user, vault, usdcAmount)` | Pull USDC from user, deposit into vault |
-| `batchDeposit(user, vaults[], amounts[])` | Multi-vault deposit in one tx (single USDC pull) |
-| `rebalance(user, fromVault, toVault, shares, feeBps)` | Move position between vaults with optional fee |
-| `batchWithdraw(user, vaults[], shares[])` | Close multiple positions, USDC returned to user |
-| `withdrawForBridge(user, vault, shares, feeBps)` | Withdraw + transfer USDC to caller for bridging |
-| `withdrawAndBridge(user, vault, shares, feeBps, ...)` | Atomic withdraw + CCTP burn |
-| `relayAndDeposit(message, attestation, user, vault)` | Atomic CCTP relay + vault deposit |
-| `depositFromBridge(user, vault, usdcAmount)` | Deposit USDC already in contract (post-relay) |
-| `addVault(vault)` | Add vault to whitelist |
-| `batchAddVaults(vaults[])` | Add multiple vaults to whitelist |
-| `removeVault(vault)` | Remove vault from whitelist |
-| `sweep(token, to)` | Sweep accumulated fees (or any ERC20) to recipient |
-| `setMaxFeeBps(bps)` | Update fee ceiling (max 500) |
-| `setFeeRecipient(addr)` | Update default fee recipient |
+| Function                                              | Description                                        |
+| ----------------------------------------------------- | -------------------------------------------------- |
+| `deposit(user, vault, usdcAmount)`                    | Pull USDC from user, deposit into vault            |
+| `batchDeposit(user, vaults[], amounts[])`             | Multi-vault deposit in one tx (single USDC pull)   |
+| `rebalance(user, fromVault, toVault, shares, feeBps)` | Move position between vaults with optional fee     |
+| `batchWithdraw(user, vaults[], shares[])`             | Close multiple positions, USDC returned to user    |
+| `withdrawForBridge(user, vault, shares, feeBps)`      | Withdraw + transfer USDC to caller for bridging    |
+| `withdrawAndBridge(user, vault, shares, feeBps, ...)` | Atomic withdraw + CCTP burn                        |
+| `relayAndDeposit(message, attestation, user, vault)`  | Atomic CCTP relay + vault deposit                  |
+| `depositFromBridge(user, vault, usdcAmount)`          | Deposit USDC already in contract (post-relay)      |
+| `addVault(vault)`                                     | Add vault to whitelist                             |
+| `batchAddVaults(vaults[])`                            | Add multiple vaults to whitelist                   |
+| `removeVault(vault)`                                  | Remove vault from whitelist                        |
+| `sweep(token, to)`                                    | Sweep accumulated fees (or any ERC20) to recipient |
+| `setMaxFeeBps(bps)`                                   | Update fee ceiling (max 500)                       |
+| `setFeeRecipient(addr)`                               | Update default fee recipient                       |
 
 ### User-callable
 
-| Function | Description |
-|---|---|
+| Function              | Description                                            |
+| --------------------- | ------------------------------------------------------ |
 | `exitPosition(vault)` | Exit a single vault position without owner involvement |
 
 ### View
 
-| Function | Description |
-|---|---|
-| `getApprovedVaults()` | Return full list of whitelisted vaults |
-| `isVaultApproved(vault)` | Check if a vault is whitelisted |
+| Function                 | Description                            |
+| ------------------------ | -------------------------------------- |
+| `getApprovedVaults()`    | Return full list of whitelisted vaults |
+| `isVaultApproved(vault)` | Check if a vault is whitelisted        |
 
 ---
 
@@ -105,16 +105,16 @@ Setting `destinationCaller = address(this)` (as bytes32) at burn time on the sou
 
 ## Security Model
 
-| Mechanism | Purpose |
-|---|---|
-| `Ownable2Step` | Two-step ownership transfer prevents accidental transfer to wrong address |
-| `ReentrancyGuard` | All state-changing functions are protected against re-entrant calls |
-| `SafeERC20` | Handles non-standard ERC20 tokens (no-return, reverting on failure) |
-| Vault whitelist | Only pre-approved vault addresses can receive deposits |
-| Zero-address guards | Constructors and setters revert on `address(0)` for critical parameters |
-| Fee ceiling (500 bps) | Hard-coded max prevents owner from setting an exploitative fee rate |
-| `exitPosition` (no auth) | Trustless exit path for users independent of the rebalancer service |
-| Low-level CCTP call | Avoids proxy return-value ABI mismatch reverts on CCTP TokenMessenger |
+| Mechanism                | Purpose                                                                   |
+| ------------------------ | ------------------------------------------------------------------------- |
+| `Ownable2Step`           | Two-step ownership transfer prevents accidental transfer to wrong address |
+| `ReentrancyGuard`        | All state-changing functions are protected against re-entrant calls       |
+| `SafeERC20`              | Handles non-standard ERC20 tokens (no-return, reverting on failure)       |
+| Vault whitelist          | Only pre-approved vault addresses can receive deposits                    |
+| Zero-address guards      | Constructors and setters revert on `address(0)` for critical parameters   |
+| Fee ceiling (500 bps)    | Hard-coded max prevents owner from setting an exploitative fee rate       |
+| `exitPosition` (no auth) | Trustless exit path for users independent of the rebalancer service       |
+| Low-level CCTP call      | Avoids proxy return-value ABI mismatch reverts on CCTP TokenMessenger     |
 
 ---
 
@@ -187,12 +187,12 @@ The Hardhat test suite (`test/YieldRebalancer.test.ts`) uses a local Hardhat net
 
 ## Deployed Addresses
 
-| Chain | Address |
-|---|---|
-| Base (8453) | [`0x80b791d72646BD4b082ff26F9DCBdca2bdfc2881`](https://basescan.org/address/0x80b791d72646BD4b082ff26F9DCBdca2bdfc2881) |
-| Monad (143) | `0x80b791d72646BD4b082ff26F9DCBdca2bdfc2881` |
+| Chain       | Address                                                                                                                 |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Base (8453) | [`0xb54206d393F4DE47450339dCA11db5b586D1621D`](https://basescan.org/address/0xb54206d393F4DE47450339dCA11db5b586D1621D) |
+| Monad (143) | `0xb54206d393F4DE47450339dCA11db5b586D1621D`                                                                            |
 
-Both chains use the same deterministic address via CreateX CREATE3 (salt version 3).
+Both chains use the same deterministic address via CreateX CREATE3 (salt version 5).
 
 ---
 

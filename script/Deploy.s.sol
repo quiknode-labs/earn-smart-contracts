@@ -5,14 +5,23 @@ import "forge-std/Script.sol";
 import "../contracts/YieldRebalancer.sol";
 import "../contracts/interfaces/ICreateX.sol";
 
+/// @dev Minimal interface to read vault list from the existing deployed contract.
+interface IExistingRebalancer {
+    function getApprovedVaults() external view returns (address[] memory);
+}
+
 /// @dev Production deployment script via CreateX CREATE3.
-///      Vaults are NOT seeded at deploy time — run scripts/add-vaults.ts after deployment.
+///      Reads the approved vault list from the old v4 contract and seeds the new
+///      contract with the same whitelist atomically in the constructor.
 ///
 /// Base:  forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "run(uint32)" 8453
 /// Monad: forge script script/Deploy.s.sol --rpc-url $MONAD_RPC_URL --broadcast --sig "run(uint32)" 143
 contract DeployYieldRebalancer is Script {
     // CreateX factory — same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
+
+    // Old v4 contract (deterministic address, same on Base and Monad)
+    address constant OLD_CONTRACT = 0x306FA08049fc34CAF69aF8097B915938dFe80B11;
 
     // Per-chain constructor args
     struct ChainConfig {
@@ -47,17 +56,18 @@ contract DeployYieldRebalancer is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
-        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 3
-        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(3))));
+        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 5
+        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(5))));
 
         address predicted = ICreateX(CREATEX).computeCreate3Address(salt, deployer);
         console.log("Chain ID:  ", chainId);
         console.log("Deployer:  ", deployer);
-        console.log("Salt (v3): version 3");
+        console.log("Salt (v5): version 5");
         console.log("Predicted: ", predicted);
 
-        // Empty vault list — add vaults post-deploy via scripts/add-vaults.ts
-        address[] memory noVaults = new address[](0);
+        // Read approved vaults from the old contract to seed the new one
+        address[] memory initialVaults = IExistingRebalancer(OLD_CONTRACT).getApprovedVaults();
+        console.log("Seeding vaults:", initialVaults.length);
 
         bytes memory initCode = abi.encodePacked(
             type(YieldRebalancer).creationCode,
@@ -66,10 +76,8 @@ contract DeployYieldRebalancer is Script {
                 cfg.aavePool,
                 cfg.aUsdc,
                 cfg.msgTransmitter,
-                deployer,   // owner
-                noVaults,   // no vaults at deploy time
-                uint16(50), // maxFeeBps: 0.50%
-                deployer    // feeRecipient
+                deployer,       // owner
+                initialVaults   // vault whitelist seeded from old contract
             )
         );
 
@@ -80,5 +88,6 @@ contract DeployYieldRebalancer is Script {
         require(deployed != address(0), "Deploy failed");
         console.log("Deployed:  ", deployed);
         console.log("Owner:     ", YieldRebalancer(deployed).owner());
+        console.log("Vaults:    ", YieldRebalancer(deployed).getApprovedVaults().length);
     }
 }
