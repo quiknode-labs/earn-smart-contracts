@@ -20,8 +20,8 @@ contract DeployYieldRebalancer is Script {
     // CreateX factory — same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
 
-    // Old v4 contract (deterministic address, same on Base and Monad)
-    address constant OLD_CONTRACT = 0x306FA08049fc34CAF69aF8097B915938dFe80B11;
+    // Old v7 contract (deterministic address, same on Base and Monad)
+    address constant OLD_CONTRACT = 0xAEA5d415FaE52623fD0415e0E0478fC4941f5afA;
 
     // Per-chain constructor args
     struct ChainConfig {
@@ -56,13 +56,13 @@ contract DeployYieldRebalancer is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
-        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 5
-        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(5))));
+        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 8
+        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(8))));
 
         address predicted = ICreateX(CREATEX).computeCreate3Address(salt, deployer);
         console.log("Chain ID:  ", chainId);
         console.log("Deployer:  ", deployer);
-        console.log("Salt (v5): version 5");
+        console.log("Salt (v8): version 8");
         console.log("Predicted: ", predicted);
 
         // Read approved vaults from the old contract to seed the new one
