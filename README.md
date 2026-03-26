@@ -1,17 +1,15 @@
 # earn-smart-contracts
 
-Smart contracts for the [QuikNode Earn](https://github.com/quiknode-labs/earn) yield-optimisation platform. This repo contains the auditable on-chain layer only — the off-chain rebalancer, frontend, and Supabase infrastructure live in the main `earn` repo.
+Non-custodial yield-optimiser contract that moves user funds between whitelisted Morpho (ERC4626) vaults and the Aave V3 Pool to maximise supply APY.
 
 ---
 
 ## Overview
 
-`YieldRebalancer` is a non-custodial contract that moves user funds between whitelisted yield-bearing vaults to keep capital in the highest-APY position at all times.
-
-- Users grant an ERC20 approval to the contract. Their principal never leaves their wallet.
-- A trusted rebalancer EOA (the contract owner) calls privileged functions to execute deposits, rebalances, and cross-chain bridges on the user's behalf.
-- Users can always exit independently via `exitPosition()` — no owner approval needed.
-- Fees are capped at 5% per operation and accumulate as USDC in the contract until swept by the owner.
+- **Non-custodial:** Users grant ERC20 approvals to the contract but never transfer principal in. All vault shares and aTokens are held by the user's wallet.
+- **Owner privileges:** A trusted rebalancer EOA (the contract owner) calls privileged functions to deposit, rebalance, and bridge on the user's behalf. The owner cannot withdraw funds to an arbitrary address — all paths route back to the user or an approved vault.
+- **User-callable functions:** Users can create strategies via `selfBatchDeposit` and close them via `selfBatchWithdraw` without owner involvement, providing a trustless exit path independent of the rebalancer service.
+- **Fee model:** Performance fees are collected as vault shares (not USDC). The executor computes 15% of yield, converts to shares, and passes them as `feeVaults[]`/`feeAmounts[]`. The contract transfers those shares from the user to itself, tracked in `heldFeeShares`. The owner sweeps via `sweep(token, amount)`.
 
 ---
 
@@ -20,9 +18,10 @@ Smart contracts for the [QuikNode Earn](https://github.com/quiknode-labs/earn) y
 **Users retain custody at all times.** The flow is:
 
 1. User approves `YieldRebalancer` to spend their USDC (and vault shares/aTokens for withdrawals).
-2. The owner (rebalancer service) calls `deposit()` or `batchDeposit()` — USDC is pulled from the user and deposited into the chosen vault. Vault shares/aTokens are minted directly to the user.
+2. The owner (rebalancer service) calls `deposit()` — USDC is pulled from the user and deposited into the chosen vault. Vault shares/aTokens are minted directly to the user.
 3. For rebalancing, the owner calls `rebalance()` — shares are pulled from the user, redeemed for USDC, and re-deposited into the new vault on behalf of the user.
-4. At no point does the contract accumulate user positions — all shares/aTokens land in the user's wallet.
+4. Users can exit independently via `selfBatchWithdraw()` — no owner approval needed.
+5. At no point does the contract accumulate user positions — all shares/aTokens land in the user's wallet.
 
 The `onlyOwner` modifier on privileged functions prevents unauthorised third parties from triggering rebalances. The owner cannot withdraw funds to an arbitrary address — all deposit/rebalance/withdraw functions route funds back to the user or to an approved vault.
 
@@ -40,19 +39,20 @@ Whitelisted vaults are stored in `vaultList`. Only addresses in this list may re
 
 The Aave V3 Pool is a single contract per chain. Instead of ERC4626, it uses `supply(asset, amount, onBehalfOf, referralCode)` and `withdraw(asset, amount, to)`. The Pool returns rebasing aTokens (1:1 with USDC, accruing interest continuously).
 
-The contract detects the Aave path by comparing the vault address to the immutable `aavePool` address.
+The contract detects the Aave path by comparing the vault address to the immutable `aavePool` address. When `vault == aavePool`, deposit/withdraw routes through `IPool` instead of `IERC4626`. On chains where Aave V3 is not deployed, `aavePool` is set to `address(0)`.
 
 ---
 
-## Cross-Chain (CCTP)
+## Cross-Chain (CCTP V2)
 
 Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC between chains:
 
-- **`withdrawAndBridge()`** — atomically withdraws from a vault and burns USDC via `ITokenMessengerV2.depositForBurn`. USDC exists in the contract for only a single transaction.
-- **`relayAndDeposit()`** — relays a CCTP attestation (minting USDC to this contract) and immediately deposits into a vault. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
-- **`withdrawForBridge()`** — a two-step variant that withdraws and transfers net USDC to the caller, allowing the burn to happen off-chain.
+- **`withdrawAndBridge()`** — Atomically withdraws from a vault, collects performance fees as vault shares, and burns USDC via `ITokenMessengerV2.depositForBurn`. USDC exists in the contract for only a single transaction.
+- **`relayAndDeposit()`** — Relays a CCTP attestation (minting USDC to this contract) and immediately deposits into a vault. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
 
-Setting `destinationCaller = address(this)` (as bytes32) at burn time on the source chain ensures only this contract can relay on the destination, preventing MEV bots from front-running the mint.
+**MEV protection:** Setting `destinationCaller = address(this)` (as bytes32) at burn time on the source chain ensures only this contract can relay on the destination, preventing MEV bots from front-running the mint.
+
+**Low-level call:** `withdrawAndBridge` uses a low-level `call` to the CCTP TokenMessenger instead of a typed interface call because some CCTP deployments are behind upgradeable proxies whose return-value encoding differs from the ABI; a direct interface call would revert on return-data decoding even when the underlying call succeeds.
 
 ---
 
@@ -60,61 +60,123 @@ Setting `destinationCaller = address(this)` (as bytes32) at burn time on the sou
 
 ### Owner-only
 
-| Function                                              | Description                                        |
-| ----------------------------------------------------- | -------------------------------------------------- |
-| `deposit(user, vault, usdcAmount)`                    | Pull USDC from user, deposit into vault            |
-| `batchDeposit(user, vaults[], amounts[])`             | Multi-vault deposit in one tx (single USDC pull)   |
-| `rebalance(user, fromVault, toVault, shares, feeBps)` | Move position between vaults with optional fee     |
-| `batchWithdraw(user, vaults[], shares[])`             | Close multiple positions, USDC returned to user    |
-| `withdrawForBridge(user, vault, shares, feeBps)`      | Withdraw + transfer USDC to caller for bridging    |
-| `withdrawAndBridge(user, vault, shares, feeBps, ...)` | Atomic withdraw + CCTP burn                        |
-| `relayAndDeposit(message, attestation, user, vault)`  | Atomic CCTP relay + vault deposit                  |
-| `depositFromBridge(user, vault, usdcAmount)`          | Deposit USDC already in contract (post-relay)      |
-| `addVault(vault)`                                     | Add vault to whitelist                             |
-| `batchAddVaults(vaults[])`                            | Add multiple vaults to whitelist                   |
-| `removeVault(vault)`                                  | Remove vault from whitelist                        |
-| `sweep(token, to)`                                    | Sweep accumulated fees (or any ERC20) to recipient |
-| `setMaxFeeBps(bps)`                                   | Update fee ceiling (max 500)                       |
-| `setFeeRecipient(addr)`                               | Update default fee recipient                       |
+| Function | Description |
+| --- | --- |
+| `deposit(user, vault, usdcAmount)` | Pull USDC from user, deposit into vault |
+| `rebalance(user, fromVault, toVault, shares, feeVaults[], feeAmounts[])` | Move position between vaults with optional performance fee collection |
+| `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], tokenMessenger, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
+| `relayAndDeposit(message, attestation, user, vault)` | Atomic CCTP relay + vault deposit |
+| `addVault(vault)` | Add vault to whitelist |
+| `batchAddVaults(vaults[])` | Add multiple vaults to whitelist |
+| `removeVault(vault)` | Remove vault from whitelist |
+| `sweep(token, amount)` | Sweep accumulated fee shares (or any ERC20) to owner |
 
 ### User-callable
 
-| Function              | Description                                            |
-| --------------------- | ------------------------------------------------------ |
-| `exitPosition(vault)` | Exit a single vault position without owner involvement |
+| Function | Description |
+| --- | --- |
+| `selfBatchDeposit(vaults[], amounts[])` | Deposit USDC into multiple vaults in one transaction (pulls total USDC in a single transfer) |
+| `selfBatchWithdraw(vaults[], shares[], feeAmounts[])` | Close vault positions with optional per-vault fee deduction, USDC returned to caller |
 
 ### View
 
-| Function                 | Description                            |
-| ------------------------ | -------------------------------------- |
-| `getApprovedVaults()`    | Return full list of whitelisted vaults |
-| `isVaultApproved(vault)` | Check if a vault is whitelisted        |
+| Function | Description |
+| --- | --- |
+| `usdc()` | USDC token address (immutable) |
+| `aavePool()` | Aave V3 Pool address (immutable, `address(0)` if not on chain) |
+| `aUsdc()` | Aave aUSDC token address (immutable, `address(0)` if not on chain) |
+| `messageTransmitter()` | CCTP V2 MessageTransmitter address (immutable) |
+| `approvedVaults(vault)` | Whether a vault is whitelisted |
+| `vaultList(index)` | Vault address by index |
+| `heldFeeShares(token)` | Accumulated fee shares for a given token |
+| `getApprovedVaults()` | Return full list of whitelisted vaults |
+| `isVaultApproved(vault)` | Check if a vault is whitelisted |
 
 ---
 
 ## Fee Model
 
-- Each privileged operation accepts a `feeBps` parameter (basis points, e.g. `5` = 0.05%).
-- The fee is deducted from the gross USDC received on withdrawal before re-depositing.
-- Fee USDC accumulates in the contract — it is never moved during the operation.
-- The owner calls `sweep(usdc, recipient)` to collect accumulated fees.
-- Hard ceiling: `maxFeeBps` (set at deploy, adjustable by owner). Absolute maximum: **500 bps (5%)**.
-- If `feeBps` exceeds `maxFeeBps`, the transaction reverts with `FeeTooHigh`.
+The contract uses a **vault-share performance fee** model, not a USDC basis-points model:
+
+1. The off-chain executor computes 15% of yield earned across all strategy vaults.
+2. For each vault with accrued yield, the executor converts the fee to vault shares.
+3. The executor passes `feeVaults[]` and `feeAmounts[]` arrays to `rebalance`, `selfBatchWithdraw`, or `withdrawAndBridge`.
+4. The contract transfers those shares from the user to itself via `safeTransferFrom`.
+5. Shares accumulate in `heldFeeShares[vault]` (for Morpho) or `heldFeeShares[aUsdc]` (for Aave).
+6. The owner sweeps accumulated shares via `sweep(token, amount)`, which transfers shares to the owner and decrements `heldFeeShares`.
+
+Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the current `fromVault`/`toVault` pair — the executor collects from ALL vaults with accrued yield in a single call to amortise gas. Each fee vault must be whitelisted.
+
+---
+
+## Custom Errors
+
+| Error | Trigger |
+| --- | --- |
+| `VaultNotApproved(address vault)` | Operation targets a vault not in the whitelist |
+| `ZeroAmount()` | Zero-amount argument where a positive value is required |
+| `ZeroAddress()` | Zero address where a non-zero address is required |
+| `InvalidInput()` | Invalid array length, empty array, `fromVault == toVault`, or `feeAmount >= shares` |
+| `ArrayLengthMismatch()` | `feeVaults` and `feeAmounts` arrays have different lengths |
+| `CctpBurnFailed()` | Low-level call to CCTP TokenMessenger's `depositForBurn` failed |
+| `MessageRelayFailed()` | CCTP `receiveMessage` relay call returned false |
+
+---
+
+## Events
+
+| Event | Emitted by |
+| --- | --- |
+| `VaultAdded(vault)` | `addVault`, `batchAddVaults`, constructor |
+| `VaultRemoved(vault)` | `removeVault` |
+| `Deposited(user, vault, usdcAmount, sharesReceived)` | `deposit`, `selfBatchDeposit` |
+| `Rebalanced(user, fromVault, toVault, shares, usdcAmount)` | `rebalance` |
+| `StrategyCreated(user, totalUsdc)` | `selfBatchDeposit` |
+| `StrategyExited(user, vault, shares, usdcReceived)` | `selfBatchWithdraw` |
+| `PerformanceFeeCollected(user, vaults[], amounts[])` | `rebalance`, `selfBatchWithdraw`, `withdrawAndBridge` (via `_collectFees`) |
+| `FeeSwept(token, recipient, amount)` | `sweep` |
+| `BridgeInitiated(user, vault, shares, usdcBurned, destDomain)` | `withdrawAndBridge` |
+| `DepositedFromBridge(user, vault, usdcAmount, sharesReceived)` | `relayAndDeposit` |
 
 ---
 
 ## Security Model
 
-| Mechanism                | Purpose                                                                   |
-| ------------------------ | ------------------------------------------------------------------------- |
-| `Ownable2Step`           | Two-step ownership transfer prevents accidental transfer to wrong address |
-| `ReentrancyGuard`        | All state-changing functions are protected against re-entrant calls       |
-| `SafeERC20`              | Handles non-standard ERC20 tokens (no-return, reverting on failure)       |
-| Vault whitelist          | Only pre-approved vault addresses can receive deposits                    |
-| Zero-address guards      | Constructors and setters revert on `address(0)` for critical parameters   |
-| Fee ceiling (500 bps)    | Hard-coded max prevents owner from setting an exploitative fee rate       |
-| `exitPosition` (no auth) | Trustless exit path for users independent of the rebalancer service       |
-| Low-level CCTP call      | Avoids proxy return-value ABI mismatch reverts on CCTP TokenMessenger     |
+| Mechanism | Purpose |
+| --- | --- |
+| `Ownable2Step` | Two-step ownership transfer prevents accidental transfer to wrong address |
+| `ReentrancyGuard` | All state-changing functions are protected against re-entrant calls |
+| `SafeERC20` | Handles non-standard ERC20 tokens (no-return, reverting on failure) |
+| Vault whitelist | Only pre-approved vault addresses can receive deposits; fee vaults must also be whitelisted |
+| Zero-address guards | Constructor and functions revert on `address(0)` for critical parameters |
+| `fromVault != toVault` guard | `rebalance` reverts if source and destination are the same vault |
+| User-callable exit (`selfBatchWithdraw`) | Trustless exit path for users independent of the rebalancer service |
+| Low-level CCTP call | Avoids proxy return-value ABI mismatch reverts on CCTP TokenMessenger |
+| Fee vault whitelist check | `_collectFees` validates each fee vault is whitelisted before transferring shares |
+
+---
+
+## Constructor
+
+```solidity
+constructor(
+    address _usdc,
+    address _aavePool,
+    address _aUsdc,
+    address _messageTransmitter,
+    address _owner,
+    address[] memory _initialVaults
+)
+```
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `_usdc` | Yes | USDC token address. Reverts on `address(0)`. |
+| `_aavePool` | No | Aave V3 Pool address. `address(0)` on chains without Aave. |
+| `_aUsdc` | No | Aave aUSDC token address. `address(0)` on chains without Aave. |
+| `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
+| `_owner` | Yes | Initial owner (rebalancer EOA). Reverts on `address(0)`. |
+| `_initialVaults` | No | Optional vault whitelist seeded at deploy time. Duplicates and zero addresses are silently skipped. |
 
 ---
 
@@ -140,13 +202,17 @@ forge script script/Deploy.s.sol \
   --private-key "$PRIVATE_KEY"
 ```
 
-**Important:** Use `forge script`, not viem's `writeContract` — viem's `eth_estimateGas` fails for large CreateX initCode. The `Deployed:` log line from the script is the authoritative contract address (`computeCreate3Address` returns the wrong value).
+**Key caveats:**
 
-After deploy, add vaults and verify via the scripts in the main `earn` repo:
+- **Use `forge script`, not viem's `writeContract`** — viem's `eth_estimateGas` fails for large CreateX initCode. Forge bypasses gas estimation.
+- **Use the `Deployed:` log line, not `Predicted:`** — `computeCreate3Address` returns the wrong address. The `Deployed:` log from the Forge script is authoritative.
+- **Bump the salt version** — `uint96(N)` in `Deploy.s.sol` for each new deployment. Never reuse a version; once the CreateX proxy is deployed it persists.
+- **Verification:** Base uses Sourcify. Monad uses Etherscan V2 API (`--verifier-url "https://api.etherscan.io/v2/api?chainid=143"`).
+
+After deploy, add vaults via the scripts in the main `earn` repo:
 
 ```bash
 npx tsx scripts/add-vaults.ts
-npx tsx scripts/verify-contract.ts --address <deployed_address>
 ```
 
 ---
@@ -156,11 +222,8 @@ npx tsx scripts/verify-contract.ts --address <deployed_address>
 ### Forge (unit tests)
 
 ```bash
-# Install dependencies
 forge install OpenZeppelin/openzeppelin-contracts
 forge install foundry-rs/forge-std
-
-# Run Forge tests
 forge test
 ```
 
@@ -173,26 +236,26 @@ npm test
 
 The Hardhat test suite (`test/YieldRebalancer.test.ts`) uses a local Hardhat network with mock contracts (`MockERC20`, `MockERC4626`) and covers:
 
-- Deployment validation (constructor args, revert cases)
-- Vault whitelist management
-- Single and batch deposits
-- Rebalancing with fee calculation
-- Fee sweep
-- Fee admin (setMaxFeeBps, setFeeRecipient)
-- User-initiated exit
-- View functions
-- Two-step ownership transfer
+- **Deployment** — constructor args, immutable state, revert on zero USDC/owner, initial vault seeding, duplicate/zero-address skipping
+- **Vault Management** — addVault, batchAddVaults, removeVault, idempotent add, events, non-owner revert
+- **Deposit** — single-vault deposit, shares in user wallet, revert on non-whitelisted vault / zero amount / zero user / non-owner
+- **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on `fromVault == toVault` / non-approved vaults / zero shares / zero user / mismatched fee arrays / non-owner
+- **selfBatchDeposit** — multi-vault deposit in one tx, revert on non-whitelisted / mismatched arrays / empty arrays / zero amount
+- **selfBatchWithdraw** — multi-vault withdrawal (no fees), withdrawal with fee deduction, `shares[i] == 0` full-balance mode, revert on non-whitelisted / mismatched arrays / `fee >= shares` / empty arrays
+- **Sweep** — owner sweeps fee shares, partial sweep bookkeeping, revert on zero amount / non-owner
+- **View Functions** — `getApprovedVaults`, `isVaultApproved`, `vaultList` enumeration
+- **Ownership** — two-step ownership transfer via `transferOwnership` + `acceptOwnership`
 
 ---
 
 ## Deployed Addresses
 
-| Chain       | Address                                                                                                                 |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Base (8453) | [`0xb54206d393F4DE47450339dCA11db5b586D1621D`](https://basescan.org/address/0xb54206d393F4DE47450339dCA11db5b586D1621D) |
-| Monad (143) | `0xb54206d393F4DE47450339dCA11db5b586D1621D`                                                                            |
+| Chain | Address | Version | Deployed |
+| --- | --- | --- | --- |
+| Base (8453) | [`0x3124F026970C322DdCb017EAa667b7d50A42c5Cc`](https://basescan.org/address/0x3124F026970C322DdCb017EAa667b7d50A42c5Cc) | v10 | 2026-03-26 |
+| Monad (143) | `0x3124F026970C322DdCb017EAa667b7d50A42c5Cc` | v10 | 2026-03-26 |
 
-Both chains use the same deterministic address via CreateX CREATE3 (salt version 5).
+Both chains use the same deterministic address via CreateX CREATE3 (salt version 10).
 
 ---
 
@@ -200,17 +263,38 @@ Both chains use the same deterministic address via CreateX CREATE3 (salt version
 
 ### Scope
 
-The primary audit target is `contracts/YieldRebalancer.sol`. The mock contracts (`contracts/mocks/`) and deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
+The primary audit target is `contracts/YieldRebalancer.sol` (~780 lines). The mock contracts (`contracts/mocks/`) and deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
 
 ### Trust Model Assumptions
 
-1. **Owner is a trusted, operationally secure EOA or multisig.** The owner can call any privileged function on behalf of any user who has granted approval. A compromised owner cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or draining fee USDC.
+1. **Owner is a trusted, operationally secure EOA or multisig.** The owner can call any privileged function on behalf of any user who has granted approval. A compromised owner cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares.
 2. **Whitelisted vaults are legitimate ERC4626 contracts or the genuine Aave V3 Pool.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
 3. **Circle's CCTP contracts are trusted.** The `relayAndDeposit` and `withdrawAndBridge` functions interact with Circle-deployed contracts without additional validation.
 4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour beyond what Aave's aUSDC provides.
 
 ### Known Constraints
 
-- `batchWithdraw` with `shares[i] == 0` reads the user's full on-chain balance. If the user has multiple strategies in the same vault, this will over-withdraw. The off-chain rebalancer always passes explicit share amounts to avoid this.
-- The `depositFromBridge` function uses a `require` rather than a custom error for the balance check — this is intentional for clarity and does not affect security.
-- `withdrawAndBridge` uses a low-level call to the CCTP TokenMessenger to avoid proxy return-value decoding issues. The `CctpBurnFailed` error is thrown if the call reverts.
+1. `selfBatchWithdraw` with `shares[i] == 0` reads the user's full on-chain balance. If the user has multiple strategies in the same vault, this will over-withdraw. The off-chain rebalancer always passes explicit share amounts to avoid this.
+2. `withdrawAndBridge` uses a low-level call to the CCTP TokenMessenger to avoid proxy return-value decoding issues. The `CctpBurnFailed` error is thrown if the call reverts.
+3. Aave fee shares are keyed by `aUsdc` (not `aavePool`) in `heldFeeShares`, since the actual token transferred is aUSDC.
+4. `_collectFees` only supports ERC4626 (Morpho) vault shares. Aave fee collection is handled inline within `selfBatchWithdraw`.
+
+---
+
+## Repository Structure
+
+```
+contracts/
+  YieldRebalancer.sol           Main contract (~780 lines)
+  interfaces/
+    ICreateX.sol                CreateX factory interface for deterministic deployment
+  mocks/
+    MockERC20.sol               Mock ERC20 for testing
+    MockERC4626.sol             Mock ERC4626 vault for testing
+script/
+  Deploy.s.sol                  Forge deployment script (CreateX CREATE3)
+test/
+  YieldRebalancer.test.ts       Hardhat + viem integration tests (~1000 lines)
+foundry.toml                    Forge config (solc 0.8.28, optimizer, via-ir)
+hardhat.config.cts              Hardhat config (.cts for ESM compatibility)
+```

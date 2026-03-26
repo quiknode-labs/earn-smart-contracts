@@ -11,7 +11,7 @@ interface IExistingRebalancer {
 }
 
 /// @dev Production deployment script via CreateX CREATE3.
-///      Reads the approved vault list from the old v4 contract and seeds the new
+///      Reads the approved vault list from the old v8 contract and seeds the new
 ///      contract with the same whitelist atomically in the constructor.
 ///
 /// Base:  forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "run(uint32)" 8453
@@ -20,8 +20,8 @@ contract DeployYieldRebalancer is Script {
     // CreateX factory — same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
 
-    // Old v7 contract (deterministic address, same on Base and Monad)
-    address constant OLD_CONTRACT = 0xAEA5d415FaE52623fD0415e0E0478fC4941f5afA;
+    // Old v9 contract (deterministic address, same on Base and Monad)
+    address constant OLD_CONTRACT = 0xAae2be1C9148839301eEa5499b6a0C7Bc0Cea7B5;
 
     // Per-chain constructor args
     struct ChainConfig {
@@ -56,17 +56,24 @@ contract DeployYieldRebalancer is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
-        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 8
-        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(8))));
+        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 10
+        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(10))));
 
         address predicted = ICreateX(CREATEX).computeCreate3Address(salt, deployer);
         console.log("Chain ID:  ", chainId);
         console.log("Deployer:  ", deployer);
-        console.log("Salt (v8): version 8");
+        console.log("Salt (v10): version 10");
         console.log("Predicted: ", predicted);
 
-        // Read approved vaults from the old contract to seed the new one
-        address[] memory initialVaults = IExistingRebalancer(OLD_CONTRACT).getApprovedVaults();
+        // Read approved vaults from the old contract to seed the new one.
+        // If the old contract doesn't exist on this chain, deploy with an empty vault list
+        // and add vaults post-deploy via scripts/add-vaults.ts.
+        address[] memory initialVaults;
+        if (OLD_CONTRACT.code.length > 0) {
+            initialVaults = IExistingRebalancer(OLD_CONTRACT).getApprovedVaults();
+        } else {
+            initialVaults = new address[](0);
+        }
         console.log("Seeding vaults:", initialVaults.length);
 
         bytes memory initCode = abi.encodePacked(

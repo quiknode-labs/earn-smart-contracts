@@ -4,6 +4,8 @@ import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 import { getAddress, parseUnits } from "viem";
 
 describe("YieldRebalancer", function () {
+  const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
   async function deployFixture() {
     const [owner, user, other] = await hre.viem.getWalletClients();
     const publicClient = await hre.viem.getPublicClient();
@@ -27,18 +29,16 @@ describe("YieldRebalancer", function () {
       "vB",
     ]);
 
-    // Deploy YieldRebalancer with fee params
+    // Deploy YieldRebalancer
     // Use owner address as placeholder for aavePool/aUsdc (not exercised in non-Aave tests)
     // address(0) for messageTransmitter — CCTP not exercised in these tests
     const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
       usdc.address,
-      owner.account.address,   // aavePool placeholder
-      owner.account.address,   // aUsdc placeholder
-      "0x0000000000000000000000000000000000000000", // messageTransmitter (disabled)
-      owner.account.address,   // owner
-      [],                      // initialVaults
-      50,                      // maxFeeBps: 0.50%
-      owner.account.address,   // feeRecipient
+      owner.account.address, // aavePool placeholder
+      owner.account.address, // aUsdc placeholder
+      ZERO_ADDRESS,          // messageTransmitter (disabled)
+      owner.account.address, // owner
+      [],                    // initialVaults
     ]);
 
     // Mint USDC to user
@@ -58,6 +58,8 @@ describe("YieldRebalancer", function () {
     };
   }
 
+  // --- Deployment ---
+
   describe("Deployment", function () {
     it("should set correct owner", async function () {
       const { rebalancer, owner } = await loadFixture(deployFixture);
@@ -73,11 +75,20 @@ describe("YieldRebalancer", function () {
       );
     });
 
-    it("should set maxFeeBps and feeRecipient", async function () {
+    it("should set aavePool and aUsdc", async function () {
       const { rebalancer, owner } = await loadFixture(deployFixture);
-      expect(await rebalancer.read.maxFeeBps()).to.equal(50);
-      expect(getAddress(await rebalancer.read.feeRecipient())).to.equal(
+      expect(getAddress(await rebalancer.read.aavePool())).to.equal(
         getAddress(owner.account.address)
+      );
+      expect(getAddress(await rebalancer.read.aUsdc())).to.equal(
+        getAddress(owner.account.address)
+      );
+    });
+
+    it("should set messageTransmitter to zero when disabled", async function () {
+      const { rebalancer } = await loadFixture(deployFixture);
+      expect(getAddress(await rebalancer.read.messageTransmitter())).to.equal(
+        getAddress(ZERO_ADDRESS)
       );
     });
 
@@ -85,19 +96,17 @@ describe("YieldRebalancer", function () {
       const [owner] = await hre.viem.getWalletClients();
       await expect(
         hre.viem.deployContract("YieldRebalancer", [
-          "0x0000000000000000000000000000000000000000",
+          ZERO_ADDRESS,
           owner.account.address,
           owner.account.address,
-          "0x0000000000000000000000000000000000000000",
+          ZERO_ADDRESS,
           owner.account.address,
           [],
-          50,
-          owner.account.address,
         ])
       ).to.be.rejectedWith("ZeroAddress");
     });
 
-    it("should revert if maxFeeBps > 500", async function () {
+    it("should revert on zero owner address", async function () {
       const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       await expect(
@@ -105,23 +114,55 @@ describe("YieldRebalancer", function () {
           usdc.address,
           owner.account.address,
           owner.account.address,
-          "0x0000000000000000000000000000000000000000",
-          owner.account.address,
+          ZERO_ADDRESS,
+          ZERO_ADDRESS,
           [],
-          501,
-          owner.account.address,
         ])
-      ).to.be.rejectedWith("MaxFeeBpsTooHigh");
+      ).to.be.rejectedWith("OwnableInvalidOwner");
+    });
+
+    it("should seed initial vaults from constructor", async function () {
+      const [owner] = await hre.viem.getWalletClients();
+      const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
+      const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
+      const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+        owner.account.address,
+        [vault.address],
+      ]);
+      expect(await rebalancer.read.isVaultApproved([vault.address])).to.be.true;
+      const vaults = await rebalancer.read.getApprovedVaults();
+      expect(vaults.length).to.equal(1);
+    });
+
+    it("should skip zero addresses and duplicates in initial vaults", async function () {
+      const [owner] = await hre.viem.getWalletClients();
+      const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
+      const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
+      const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+        owner.account.address,
+        [vault.address, ZERO_ADDRESS, vault.address], // dup + zero
+      ]);
+      const vaults = await rebalancer.read.getApprovedVaults();
+      expect(vaults.length).to.equal(1);
     });
   });
+
+  // --- Vault Management ---
 
   describe("Vault Management", function () {
     it("should add vault to whitelist", async function () {
       const { rebalancer, vaultA } = await loadFixture(deployFixture);
       await rebalancer.write.addVault([vaultA.address]);
 
-      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be
-        .true;
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.true;
       const vaults = await rebalancer.read.getApprovedVaults();
       expect(vaults.length).to.equal(1);
       expect(getAddress(vaults[0])).to.equal(getAddress(vaultA.address));
@@ -144,13 +185,29 @@ describe("YieldRebalancer", function () {
       expect(vaults.length).to.equal(1);
     });
 
+    it("should batch-add multiple vaults", async function () {
+      const { rebalancer, vaultA, vaultB } = await loadFixture(deployFixture);
+      await rebalancer.write.batchAddVaults([[vaultA.address, vaultB.address]]);
+
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.true;
+      expect(await rebalancer.read.isVaultApproved([vaultB.address])).to.be.true;
+      const vaults = await rebalancer.read.getApprovedVaults();
+      expect(vaults.length).to.equal(2);
+    });
+
+    it("batchAddVaults reverts on zero address", async function () {
+      const { rebalancer, vaultA } = await loadFixture(deployFixture);
+      await expect(
+        rebalancer.write.batchAddVaults([[vaultA.address, ZERO_ADDRESS]])
+      ).to.be.rejectedWith("ZeroAddress");
+    });
+
     it("should remove vault from whitelist", async function () {
       const { rebalancer, vaultA } = await loadFixture(deployFixture);
       await rebalancer.write.addVault([vaultA.address]);
       await rebalancer.write.removeVault([vaultA.address]);
 
-      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be
-        .false;
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.false;
       const vaults = await rebalancer.read.getApprovedVaults();
       expect(vaults.length).to.equal(0);
     });
@@ -165,9 +222,7 @@ describe("YieldRebalancer", function () {
     it("should revert adding zero address vault", async function () {
       const { rebalancer } = await loadFixture(deployFixture);
       await expect(
-        rebalancer.write.addVault([
-          "0x0000000000000000000000000000000000000000",
-        ])
+        rebalancer.write.addVault([ZERO_ADDRESS])
       ).to.be.rejectedWith("ZeroAddress");
     });
 
@@ -197,16 +252,16 @@ describe("YieldRebalancer", function () {
     });
   });
 
+  // --- Deposit ---
+
   describe("Deposit", function () {
     it("should deposit USDC into vault on behalf of user", async function () {
       const { rebalancer, usdc, vaultA, user } =
         await loadFixture(deployFixture);
 
-      // Setup: add vault, user approves rebalancer
       await rebalancer.write.addVault([vaultA.address]);
       const depositAmount = parseUnits("1000", 6);
 
-      // User approves rebalancer to spend USDC
       const usdcAsUser = await hre.viem.getContractAt(
         "MockERC20",
         usdc.address,
@@ -214,21 +269,18 @@ describe("YieldRebalancer", function () {
       );
       await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
 
-      // Owner calls deposit on behalf of user
       await rebalancer.write.deposit([
         user.account.address,
         vaultA.address,
         depositAmount,
       ]);
 
-      // Shares should be in user's wallet (not rebalancer)
+      // Shares should be in user's wallet
       const userShares = await vaultA.read.balanceOf([user.account.address]);
       expect(userShares > 0n).to.be.true;
 
       // Rebalancer should hold zero shares
-      const rebalancerShares = await vaultA.read.balanceOf([
-        rebalancer.address,
-      ]);
+      const rebalancerShares = await vaultA.read.balanceOf([rebalancer.address]);
       expect(rebalancerShares).to.equal(0n);
 
       // USDC should be in the vault
@@ -241,7 +293,6 @@ describe("YieldRebalancer", function () {
         await loadFixture(deployFixture);
       const depositAmount = parseUnits("1000", 6);
 
-      // User approves but vault not whitelisted
       const usdcAsUser = await hre.viem.getContractAt(
         "MockERC20",
         usdc.address,
@@ -273,7 +324,7 @@ describe("YieldRebalancer", function () {
 
       await expect(
         rebalancer.write.deposit([
-          "0x0000000000000000000000000000000000000000",
+          ZERO_ADDRESS,
           vaultA.address,
           parseUnits("100", 6),
         ])
@@ -308,16 +359,16 @@ describe("YieldRebalancer", function () {
     });
   });
 
+  // --- Rebalance ---
+
   describe("Rebalance", function () {
     async function depositedFixture() {
       const base = await deployFixture();
       const { rebalancer, usdc, vaultA, vaultB, user } = base;
 
-      // Add both vaults
       await rebalancer.write.addVault([vaultA.address]);
       await rebalancer.write.addVault([vaultB.address]);
 
-      // User approves rebalancer for USDC
       const depositAmount = parseUnits("1000", 6);
       const usdcAsUser = await hre.viem.getContractAt(
         "MockERC20",
@@ -326,7 +377,6 @@ describe("YieldRebalancer", function () {
       );
       await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
 
-      // Deposit into vaultA
       await rebalancer.write.deposit([
         user.account.address,
         vaultA.address,
@@ -340,22 +390,23 @@ describe("YieldRebalancer", function () {
         { client: { wallet: user } }
       );
       const userShares = await vaultA.read.balanceOf([user.account.address]);
-      await vaultAAsUser.write.approve([rebalancer.address, userShares]);
+      await vaultAAsUser.write.approve([rebalancer.address, userShares * 2n]); // extra for fees
 
       return { ...base, depositAmount, userShares };
     }
 
-    it("should rebalance from vaultA to vaultB (feeBps=0, no fee)", async function () {
+    it("should rebalance from vaultA to vaultB (no fee)", async function () {
       const { rebalancer, usdc, vaultA, vaultB, user, userShares } =
         await loadFixture(depositedFixture);
 
-      // Rebalance all shares from vaultA to vaultB with zero fee
+      // Rebalance with empty fee arrays
       await rebalancer.write.rebalance([
         user.account.address,
         vaultA.address,
         vaultB.address,
         userShares,
-        0,  // feeBps
+        [],  // feeVaults
+        [],  // feeAmounts
       ]);
 
       // User should have zero vaultA shares
@@ -366,85 +417,56 @@ describe("YieldRebalancer", function () {
       const sharesB = await vaultB.read.balanceOf([user.account.address]);
       expect(sharesB > 0n).to.be.true;
 
-      // Rebalancer should hold nothing (no fee charged)
+      // Rebalancer should hold nothing
       const rebalancerUsdc = await usdc.read.balanceOf([rebalancer.address]);
       expect(rebalancerUsdc).to.equal(0n);
-      const rebalancerA = await vaultA.read.balanceOf([rebalancer.address]);
-      expect(rebalancerA).to.equal(0n);
-      const rebalancerB = await vaultB.read.balanceOf([rebalancer.address]);
-      expect(rebalancerB).to.equal(0n);
     });
 
-    it("should collect fee USDC in contract when feeBps > 0", async function () {
-      const { rebalancer, usdc, vaultA, vaultB, user, userShares, depositAmount } =
-        await loadFixture(depositedFixture);
-
-      // Rebalance with feeBps=5 (0.05%)
-      await rebalancer.write.rebalance([
-        user.account.address,
-        vaultA.address,
-        vaultB.address,
-        userShares,
-        5,  // feeBps
-      ]);
-
-      // Expected fee: 1000 USDC * 5 / 10000 = 0.5 USDC = 500000 raw
-      const expectedFee = depositAmount * 5n / 10000n;
-
-      // Contract should hold the fee
-      const contractUsdc = await usdc.read.balanceOf([rebalancer.address]);
-      expect(contractUsdc).to.equal(expectedFee);
-
-      // User should have received reduced amount in vaultB
-      const sharesB = await vaultB.read.balanceOf([user.account.address]);
-      expect(sharesB > 0n).to.be.true;
-
-      // User should have zero vaultA shares
-      const remainingA = await vaultA.read.balanceOf([user.account.address]);
-      expect(remainingA).to.equal(0n);
-    });
-
-    it("should deposit reduced amount into toVault after fee deduction", async function () {
-      const { rebalancer, usdc, vaultA, vaultB, user, userShares, depositAmount } =
-        await loadFixture(depositedFixture);
-
-      const feeBps = 10; // 0.10%
-      await rebalancer.write.rebalance([
-        user.account.address,
-        vaultA.address,
-        vaultB.address,
-        userShares,
-        feeBps,
-      ]);
-
-      // vaultB should hold: depositAmount - feeAmount
-      const feeAmount = depositAmount * BigInt(feeBps) / 10000n;
-      const expectedInVaultB = depositAmount - feeAmount;
-      const vaultBUsdcBalance = await usdc.read.balanceOf([vaultB.address]);
-      expect(vaultBUsdcBalance).to.equal(expectedInVaultB);
-    });
-
-    it("should revert if feeBps exceeds maxFeeBps", async function () {
+    it("should collect fee shares during rebalance", async function () {
       const { rebalancer, vaultA, vaultB, user, userShares } =
         await loadFixture(depositedFixture);
 
-      // maxFeeBps is 50; try 51
+      // Fee: take 10 shares from vaultA as performance fee
+      const feeShares = userShares / 100n; // 1% of shares
+
+      await rebalancer.write.rebalance([
+        user.account.address,
+        vaultA.address,
+        vaultB.address,
+        userShares - feeShares, // net shares to move
+        [vaultA.address],       // feeVaults
+        [feeShares],            // feeAmounts
+      ]);
+
+      // Rebalancer should hold fee shares of vaultA
+      const rebalancerSharesA = await vaultA.read.balanceOf([rebalancer.address]);
+      expect(rebalancerSharesA).to.equal(feeShares);
+
+      // heldFeeShares should be tracked
+      const held = await rebalancer.read.heldFeeShares([vaultA.address]);
+      expect(held).to.equal(feeShares);
+    });
+
+    it("should revert if fromVault == toVault", async function () {
+      const { rebalancer, vaultA, user, userShares } =
+        await loadFixture(depositedFixture);
+
       await expect(
         rebalancer.write.rebalance([
           user.account.address,
           vaultA.address,
-          vaultB.address,
+          vaultA.address,
           userShares,
-          51,
+          [],
+          [],
         ])
-      ).to.be.rejectedWith("FeeTooHigh");
+      ).to.be.rejectedWith("InvalidInput");
     });
 
     it("should revert if fromVault not approved", async function () {
       const { rebalancer, vaultA, vaultB, user, userShares } =
         await loadFixture(depositedFixture);
 
-      // Remove vaultA from whitelist
       await rebalancer.write.removeVault([vaultA.address]);
 
       await expect(
@@ -453,7 +475,8 @@ describe("YieldRebalancer", function () {
           vaultA.address,
           vaultB.address,
           userShares,
-          0,
+          [],
+          [],
         ])
       ).to.be.rejectedWith("VaultNotApproved");
     });
@@ -462,7 +485,6 @@ describe("YieldRebalancer", function () {
       const { rebalancer, vaultA, vaultB, user, userShares } =
         await loadFixture(depositedFixture);
 
-      // Remove vaultB from whitelist
       await rebalancer.write.removeVault([vaultB.address]);
 
       await expect(
@@ -471,7 +493,8 @@ describe("YieldRebalancer", function () {
           vaultA.address,
           vaultB.address,
           userShares,
-          0,
+          [],
+          [],
         ])
       ).to.be.rejectedWith("VaultNotApproved");
     });
@@ -486,7 +509,8 @@ describe("YieldRebalancer", function () {
           vaultA.address,
           vaultB.address,
           0n,
-          0,
+          [],
+          [],
         ])
       ).to.be.rejectedWith("ZeroAmount");
     });
@@ -497,13 +521,30 @@ describe("YieldRebalancer", function () {
 
       await expect(
         rebalancer.write.rebalance([
-          "0x0000000000000000000000000000000000000000",
+          ZERO_ADDRESS,
           vaultA.address,
           vaultB.address,
           userShares,
-          0,
+          [],
+          [],
         ])
       ).to.be.rejectedWith("ZeroAddress");
+    });
+
+    it("should revert on mismatched fee array lengths", async function () {
+      const { rebalancer, vaultA, vaultB, user, userShares } =
+        await loadFixture(depositedFixture);
+
+      await expect(
+        rebalancer.write.rebalance([
+          user.account.address,
+          vaultA.address,
+          vaultB.address,
+          userShares,
+          [vaultA.address],
+          [],  // mismatched
+        ])
+      ).to.be.rejectedWith("ArrayLengthMismatch");
     });
 
     it("non-owner cannot call rebalance", async function () {
@@ -521,70 +562,294 @@ describe("YieldRebalancer", function () {
           vaultA.address,
           vaultB.address,
           userShares,
-          0,
+          [],
+          [],
         ])
       ).to.be.rejectedWith("OwnableUnauthorizedAccount");
     });
+  });
 
-    it("removeVault prevents rebalancing to that vault", async function () {
-      const { rebalancer, vaultA, vaultB, user, userShares } =
-        await loadFixture(depositedFixture);
+  // --- selfBatchDeposit ---
 
-      // Remove vaultB, try to rebalance into it
-      await rebalancer.write.removeVault([vaultB.address]);
-
-      await expect(
-        rebalancer.write.rebalance([
-          user.account.address,
-          vaultA.address,
-          vaultB.address,
-          userShares,
-          0,
-        ])
-      ).to.be.rejectedWith("VaultNotApproved");
-    });
-
-    it("tiny rebalance where fee rounds to zero should not revert", async function () {
+  describe("selfBatchDeposit", function () {
+    it("should deposit into multiple vaults in one transaction", async function () {
       const { rebalancer, usdc, vaultA, vaultB, user } =
-        await loadFixture(depositedFixture);
+        await loadFixture(deployFixture);
 
-      // Deposit 1 wei-equivalent (1 raw USDC unit = $0.000001)
-      const tinyUsdc = 1n;
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+
+      const amountA = parseUnits("500", 6);
+      const amountB = parseUnits("300", 6);
+
       const usdcAsUser = await hre.viem.getContractAt(
         "MockERC20",
         usdc.address,
         { client: { wallet: user } }
       );
-      await usdc.write.mint([user.account.address, tinyUsdc]);
-      await usdcAsUser.write.approve([rebalancer.address, tinyUsdc]);
-      await rebalancer.write.deposit([user.account.address, vaultA.address, tinyUsdc]);
+      await usdcAsUser.write.approve([rebalancer.address, amountA + amountB]);
 
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await rebalancerAsUser.write.selfBatchDeposit([
+        [vaultA.address, vaultB.address],
+        [amountA, amountB],
+      ]);
+
+      // User should have shares in both vaults
+      const sharesA = await vaultA.read.balanceOf([user.account.address]);
+      expect(sharesA > 0n).to.be.true;
+      const sharesB = await vaultB.read.balanceOf([user.account.address]);
+      expect(sharesB > 0n).to.be.true;
+
+      // USDC should be in each vault
+      expect(await usdc.read.balanceOf([vaultA.address])).to.equal(amountA);
+      expect(await usdc.read.balanceOf([vaultB.address])).to.equal(amountB);
+    });
+
+    it("should revert on non-whitelisted vault", async function () {
+      const { rebalancer, usdc, vaultA, user } =
+        await loadFixture(deployFixture);
+
+      const amount = parseUnits("100", 6);
+      const usdcAsUser = await hre.viem.getContractAt(
+        "MockERC20",
+        usdc.address,
+        { client: { wallet: user } }
+      );
+      await usdcAsUser.write.approve([rebalancer.address, amount]);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await expect(
+        rebalancerAsUser.write.selfBatchDeposit([
+          [vaultA.address],
+          [amount],
+        ])
+      ).to.be.rejectedWith("VaultNotApproved");
+    });
+
+    it("should revert on mismatched array lengths", async function () {
+      const { rebalancer, vaultA, user } = await loadFixture(deployFixture);
+      await rebalancer.write.addVault([vaultA.address]);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await expect(
+        rebalancerAsUser.write.selfBatchDeposit([
+          [vaultA.address],
+          [parseUnits("100", 6), parseUnits("200", 6)],
+        ])
+      ).to.be.rejectedWith("InvalidInput");
+    });
+
+    it("should revert on empty arrays", async function () {
+      const { rebalancer, user } = await loadFixture(deployFixture);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await expect(
+        rebalancerAsUser.write.selfBatchDeposit([[], []])
+      ).to.be.rejectedWith("InvalidInput");
+    });
+
+    it("should revert on zero amount", async function () {
+      const { rebalancer, vaultA, user } = await loadFixture(deployFixture);
+      await rebalancer.write.addVault([vaultA.address]);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await expect(
+        rebalancerAsUser.write.selfBatchDeposit([
+          [vaultA.address],
+          [0n],
+        ])
+      ).to.be.rejectedWith("ZeroAmount");
+    });
+  });
+
+  // --- selfBatchWithdraw ---
+
+  describe("selfBatchWithdraw", function () {
+    async function depositedMultiFixture() {
+      const base = await deployFixture();
+      const { rebalancer, usdc, vaultA, vaultB, user } = base;
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+
+      const amountA = parseUnits("500", 6);
+      const amountB = parseUnits("300", 6);
+
+      const usdcAsUser = await hre.viem.getContractAt(
+        "MockERC20",
+        usdc.address,
+        { client: { wallet: user } }
+      );
+      await usdcAsUser.write.approve([rebalancer.address, amountA + amountB]);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "YieldRebalancer",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await rebalancerAsUser.write.selfBatchDeposit([
+        [vaultA.address, vaultB.address],
+        [amountA, amountB],
+      ]);
+
+      const sharesA = await vaultA.read.balanceOf([user.account.address]);
+      const sharesB = await vaultB.read.balanceOf([user.account.address]);
+
+      // Approve rebalancer to spend vault shares
       const vaultAAsUser = await hre.viem.getContractAt(
         "MockERC4626",
         vaultA.address,
         { client: { wallet: user } }
       );
-      const tinyShares = await vaultA.read.balanceOf([user.account.address]);
-      await vaultAAsUser.write.approve([rebalancer.address, tinyShares]);
+      const vaultBAsUser = await hre.viem.getContractAt(
+        "MockERC4626",
+        vaultB.address,
+        { client: { wallet: user } }
+      );
+      await vaultAAsUser.write.approve([rebalancer.address, sharesA]);
+      await vaultBAsUser.write.approve([rebalancer.address, sharesB]);
 
-      // feeBps=5, amount=1 → fee = 1 * 5 / 10000 = 0 (rounds to zero in solidity)
+      return { ...base, amountA, amountB, sharesA, sharesB, rebalancerAsUser };
+    }
+
+    it("should withdraw from multiple vaults (no fees)", async function () {
+      const { usdc, vaultA, vaultB, user, rebalancerAsUser, sharesA, sharesB } =
+        await loadFixture(depositedMultiFixture);
+
+      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
+
+      await rebalancerAsUser.write.selfBatchWithdraw([
+        [vaultA.address, vaultB.address],
+        [sharesA, sharesB],
+        [0n, 0n],  // no fees
+      ]);
+
+      // User should get USDC back
+      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
+      expect(usdcAfter - usdcBefore).to.equal(parseUnits("800", 6));
+
+      // User should have zero shares
+      expect(await vaultA.read.balanceOf([user.account.address])).to.equal(0n);
+      expect(await vaultB.read.balanceOf([user.account.address])).to.equal(0n);
+    });
+
+    it("should withdraw with fees deducted as vault shares", async function () {
+      const { rebalancer, usdc, vaultA, vaultB, user, rebalancerAsUser, sharesA, sharesB } =
+        await loadFixture(depositedMultiFixture);
+
+      const feeA = sharesA / 100n; // 1% fee from vaultA
+
+      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
+
+      await rebalancerAsUser.write.selfBatchWithdraw([
+        [vaultA.address, vaultB.address],
+        [sharesA, sharesB],
+        [feeA, 0n],
+      ]);
+
+      // Rebalancer should hold feeA shares of vaultA
+      const heldA = await vaultA.read.balanceOf([rebalancer.address]);
+      expect(heldA).to.equal(feeA);
+
+      // heldFeeShares should track it
+      const tracked = await rebalancer.read.heldFeeShares([vaultA.address]);
+      expect(tracked).to.equal(feeA);
+
+      // User gets reduced USDC (fee shares not redeemed to user)
+      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
+      expect(usdcAfter > usdcBefore).to.be.true;
+    });
+
+    it("should use full balance when shares[i] == 0", async function () {
+      const { usdc, vaultA, vaultB, user, rebalancerAsUser } =
+        await loadFixture(depositedMultiFixture);
+
+      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
+
+      await rebalancerAsUser.write.selfBatchWithdraw([
+        [vaultA.address, vaultB.address],
+        [0n, 0n],   // 0 = full balance
+        [0n, 0n],
+      ]);
+
+      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
+      expect(usdcAfter - usdcBefore).to.equal(parseUnits("800", 6));
+    });
+
+    it("should revert on non-whitelisted vault", async function () {
+      const { rebalancer, vaultA, user, sharesA, rebalancerAsUser } =
+        await loadFixture(depositedMultiFixture);
+
+      await rebalancer.write.removeVault([vaultA.address]);
+
       await expect(
-        rebalancer.write.rebalance([
-          user.account.address,
-          vaultA.address,
-          vaultB.address,
-          tinyShares,
-          5,
+        rebalancerAsUser.write.selfBatchWithdraw([
+          [vaultA.address],
+          [sharesA],
+          [0n],
         ])
-      ).to.not.be.rejected;
+      ).to.be.rejectedWith("VaultNotApproved");
+    });
 
-      // Contract holds zero fee (dust rounds to 0)
-      const contractUsdc = await usdc.read.balanceOf([rebalancer.address]);
-      expect(contractUsdc).to.equal(0n);
+    it("should revert on mismatched array lengths", async function () {
+      const { rebalancerAsUser, vaultA, sharesA } =
+        await loadFixture(depositedMultiFixture);
+
+      await expect(
+        rebalancerAsUser.write.selfBatchWithdraw([
+          [vaultA.address],
+          [sharesA],
+          [0n, 0n],  // mismatched
+        ])
+      ).to.be.rejectedWith("ArrayLengthMismatch");
+    });
+
+    it("should revert if fee >= shares", async function () {
+      const { rebalancerAsUser, vaultA, sharesA } =
+        await loadFixture(depositedMultiFixture);
+
+      await expect(
+        rebalancerAsUser.write.selfBatchWithdraw([
+          [vaultA.address],
+          [sharesA],
+          [sharesA],  // fee == shares, should revert
+        ])
+      ).to.be.rejectedWith("InvalidInput");
+    });
+
+    it("should revert on empty vaults array", async function () {
+      const { rebalancerAsUser } = await loadFixture(depositedMultiFixture);
+
+      await expect(
+        rebalancerAsUser.write.selfBatchWithdraw([[], [], []])
+      ).to.be.rejectedWith("InvalidInput");
     });
   });
 
-  describe("Fee Sweep", function () {
+  // --- Sweep ---
+
+  describe("Sweep", function () {
     async function feeAccruedFixture() {
       const base = await deployFixture();
       const { rebalancer, usdc, vaultA, vaultB, user } = base;
@@ -599,8 +864,14 @@ describe("YieldRebalancer", function () {
         { client: { wallet: user } }
       );
       await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-      await rebalancer.write.deposit([user.account.address, vaultA.address, depositAmount]);
 
+      await rebalancer.write.deposit([
+        user.account.address,
+        vaultA.address,
+        depositAmount,
+      ]);
+
+      // User approves rebalancer for vault shares (extra for fee)
       const vaultAAsUser = await hre.viem.getContractAt(
         "MockERC4626",
         vaultA.address,
@@ -609,201 +880,69 @@ describe("YieldRebalancer", function () {
       const userShares = await vaultA.read.balanceOf([user.account.address]);
       await vaultAAsUser.write.approve([rebalancer.address, userShares]);
 
-      // Rebalance with feeBps=5 to accrue fee
+      // Rebalance with fee to accrue fee shares in the contract
+      const feeShares = userShares / 100n; // 1%
       await rebalancer.write.rebalance([
         user.account.address,
         vaultA.address,
         vaultB.address,
-        userShares,
-        5,
+        userShares - feeShares,
+        [vaultA.address],
+        [feeShares],
       ]);
 
-      const feeAccrued = depositAmount * 5n / 10000n; // 500000 raw = 0.5 USDC
-      return { ...base, depositAmount, userShares, feeAccrued };
+      return { ...base, depositAmount, userShares, feeShares };
     }
 
-    it("owner can sweep fee USDC to a specified address", async function () {
-      const { rebalancer, usdc, other, feeAccrued } =
+    it("owner can sweep fee shares to owner address", async function () {
+      const { rebalancer, vaultA, owner, feeShares } =
         await loadFixture(feeAccruedFixture);
 
-      const beforeBalance = await usdc.read.balanceOf([other.account.address]);
-      await rebalancer.write.sweep([usdc.address, other.account.address]);
-      const afterBalance = await usdc.read.balanceOf([other.account.address]);
+      const beforeBalance = await vaultA.read.balanceOf([owner.account.address]);
+      await rebalancer.write.sweep([vaultA.address, feeShares]);
+      const afterBalance = await vaultA.read.balanceOf([owner.account.address]);
 
-      expect(afterBalance - beforeBalance).to.equal(feeAccrued);
-      expect(await usdc.read.balanceOf([rebalancer.address])).to.equal(0n);
+      expect(afterBalance - beforeBalance).to.equal(feeShares);
+      // heldFeeShares should be decremented
+      expect(await rebalancer.read.heldFeeShares([vaultA.address])).to.equal(0n);
     });
 
-    it("sweep with zero address sends to feeRecipient", async function () {
-      const { rebalancer, usdc, owner, feeAccrued } =
-        await loadFixture(feeAccruedFixture);
+    it("should revert on zero amount", async function () {
+      const { rebalancer, vaultA } = await loadFixture(feeAccruedFixture);
 
-      const beforeBalance = await usdc.read.balanceOf([owner.account.address]);
-      await rebalancer.write.sweep([
-        usdc.address,
-        "0x0000000000000000000000000000000000000000",
-      ]);
-      const afterBalance = await usdc.read.balanceOf([owner.account.address]);
-
-      expect(afterBalance - beforeBalance).to.equal(feeAccrued);
+      await expect(
+        rebalancer.write.sweep([vaultA.address, 0n])
+      ).to.be.rejectedWith("ZeroAmount");
     });
 
     it("non-owner cannot sweep", async function () {
-      const { rebalancer, usdc, other } = await loadFixture(feeAccruedFixture);
+      const { rebalancer, vaultA, other, feeShares } =
+        await loadFixture(feeAccruedFixture);
+
       const rebalancerAsOther = await hre.viem.getContractAt(
         "YieldRebalancer",
         rebalancer.address,
         { client: { wallet: other } }
       );
       await expect(
-        rebalancerAsOther.write.sweep([usdc.address, other.account.address])
-      ).to.be.rejectedWith("OwnableUnauthorizedAccount");
-    });
-  });
-
-  describe("Fee Admin", function () {
-    it("setMaxFeeBps updates the cap", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      await rebalancer.write.setMaxFeeBps([100]);
-      expect(await rebalancer.read.maxFeeBps()).to.equal(100);
-    });
-
-    it("setMaxFeeBps reverts above 500", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      await expect(
-        rebalancer.write.setMaxFeeBps([501])
-      ).to.be.rejectedWith("MaxFeeBpsTooHigh");
-    });
-
-    it("setMaxFeeBps allows exactly 500", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      await rebalancer.write.setMaxFeeBps([500]);
-      expect(await rebalancer.read.maxFeeBps()).to.equal(500);
-    });
-
-    it("setFeeRecipient updates the recipient", async function () {
-      const { rebalancer, other } = await loadFixture(deployFixture);
-      await rebalancer.write.setFeeRecipient([other.account.address]);
-      expect(getAddress(await rebalancer.read.feeRecipient())).to.equal(
-        getAddress(other.account.address)
-      );
-    });
-
-    it("setFeeRecipient reverts on zero address", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      await expect(
-        rebalancer.write.setFeeRecipient([
-          "0x0000000000000000000000000000000000000000",
-        ])
-      ).to.be.rejectedWith("ZeroAddress");
-    });
-
-    it("non-owner cannot call setMaxFeeBps", async function () {
-      const { rebalancer, other } = await loadFixture(deployFixture);
-      const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
-        rebalancer.address,
-        { client: { wallet: other } }
-      );
-      await expect(
-        rebalancerAsOther.write.setMaxFeeBps([10])
+        rebalancerAsOther.write.sweep([vaultA.address, feeShares])
       ).to.be.rejectedWith("OwnableUnauthorizedAccount");
     });
 
-    it("non-owner cannot call setFeeRecipient", async function () {
-      const { rebalancer, other } = await loadFixture(deployFixture);
-      const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
-        rebalancer.address,
-        { client: { wallet: other } }
+    it("partial sweep decrements heldFeeShares correctly", async function () {
+      const { rebalancer, vaultA, feeShares } =
+        await loadFixture(feeAccruedFixture);
+
+      const halfFee = feeShares / 2n;
+      await rebalancer.write.sweep([vaultA.address, halfFee]);
+
+      expect(await rebalancer.read.heldFeeShares([vaultA.address])).to.equal(
+        feeShares - halfFee
       );
-      await expect(
-        rebalancerAsOther.write.setFeeRecipient([other.account.address])
-      ).to.be.rejectedWith("OwnableUnauthorizedAccount");
     });
   });
 
-  describe("Exit Position", function () {
-    it("user can exit without rebalancer", async function () {
-      const { rebalancer, usdc, vaultA, user } =
-        await loadFixture(deployFixture);
-
-      // Setup: add vault, deposit
-      await rebalancer.write.addVault([vaultA.address]);
-      const depositAmount = parseUnits("1000", 6);
-
-      const usdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        usdc.address,
-        { client: { wallet: user } }
-      );
-      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-
-      await rebalancer.write.deposit([
-        user.account.address,
-        vaultA.address,
-        depositAmount,
-      ]);
-
-      // User approves rebalancer for vault shares
-      const vaultAAsUser = await hre.viem.getContractAt(
-        "MockERC4626",
-        vaultA.address,
-        { client: { wallet: user } }
-      );
-      const shares = await vaultA.read.balanceOf([user.account.address]);
-      await vaultAAsUser.write.approve([rebalancer.address, shares]);
-
-      // Record USDC balance before
-      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
-
-      // User calls exitPosition directly
-      const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
-        rebalancer.address,
-        { client: { wallet: user } }
-      );
-      await rebalancerAsUser.write.exitPosition([vaultA.address]);
-
-      // User should have USDC back
-      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
-      expect(usdcAfter - usdcBefore).to.equal(depositAmount);
-
-      // User should have zero vault shares
-      const remainingShares = await vaultA.read.balanceOf([
-        user.account.address,
-      ]);
-      expect(remainingShares).to.equal(0n);
-    });
-
-    it("should revert on non-approved vault", async function () {
-      const { rebalancer, vaultA, user } = await loadFixture(deployFixture);
-
-      const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
-        rebalancer.address,
-        { client: { wallet: user } }
-      );
-      await expect(
-        rebalancerAsUser.write.exitPosition([vaultA.address])
-      ).to.be.rejectedWith("VaultNotApproved");
-    });
-
-    it("should revert if user has zero shares", async function () {
-      const { rebalancer, vaultA, other } = await loadFixture(deployFixture);
-      await rebalancer.write.addVault([vaultA.address]);
-
-      // other has no shares
-      const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
-        rebalancer.address,
-        { client: { wallet: other } }
-      );
-      await expect(
-        rebalancerAsOther.write.exitPosition([vaultA.address])
-      ).to.be.rejectedWith("ZeroAmount");
-    });
-  });
+  // --- View Functions ---
 
   describe("View Functions", function () {
     it("getApprovedVaults returns all vaults", async function () {
@@ -819,10 +958,8 @@ describe("YieldRebalancer", function () {
       const { rebalancer, vaultA, vaultB } = await loadFixture(deployFixture);
       await rebalancer.write.addVault([vaultA.address]);
 
-      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be
-        .true;
-      expect(await rebalancer.read.isVaultApproved([vaultB.address])).to.be
-        .false;
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.true;
+      expect(await rebalancer.read.isVaultApproved([vaultB.address])).to.be.false;
     });
 
     it("vaultList is enumerable", async function () {
@@ -836,6 +973,8 @@ describe("YieldRebalancer", function () {
       expect(getAddress(v1)).to.equal(getAddress(vaultB.address));
     });
   });
+
+  // --- Ownership ---
 
   describe("Ownership", function () {
     it("uses 2-step ownership transfer", async function () {

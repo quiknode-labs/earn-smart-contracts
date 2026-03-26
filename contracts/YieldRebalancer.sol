@@ -38,9 +38,10 @@ interface ITokenMessengerV2 {
 ///      - Users retain full custody: they grant ERC20 approvals to this contract but
 ///        never transfer principal in; all vault shares/aTokens are held by the user.
 ///      - The owner (a trusted rebalancer EOA/service) calls the privileged functions
-///        (`deposit`, `rebalance`, `batchDeposit`, `withdrawAndBridge`,
-///        `relayAndDeposit`) to move capital on the user's behalf.
-///      - Users can close their own strategy via `selfBatchWithdraw` without owner involvement.
+///        (`deposit`, `rebalance`, `withdrawAndBridge`, `relayAndDeposit`)
+///        to move capital on the user's behalf.
+///      - Users can create strategies via `selfBatchDeposit` and close them via
+///        `selfBatchWithdraw` without owner involvement.
 ///      - Fee model: a performance fee is collected as vault shares (not USDC). The executor
 ///        computes 15% of yield earned across ALL strategy vaults, converts each to vault
 ///        shares, and passes them as `feeVaults[]`/`feeAmounts[]` on rebalance/withdraw
@@ -55,8 +56,9 @@ interface ITokenMessengerV2 {
 ///        an uncontrolled address.
 ///      - CCTP integration: `withdrawAndBridge` burns USDC cross-chain via Circle's
 ///        CCTP V2; `relayAndDeposit` relays a CCTP message and atomically deposits.
-///      - The `exitPosition` function is deliberately user-callable with no owner
-///        requirement, providing a trustless exit path independent of the rebalancer.
+///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
+///        with no owner requirement, providing a trustless exit path independent of
+///        the rebalancer.
 contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -91,7 +93,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     /// @notice Accumulated vault shares taken as performance fees, keyed by vault address.
     ///         Incremented each time the executor passes non-empty `feeVaults`/`feeAmounts`
     ///         to `rebalance`, `selfBatchWithdraw`, or `withdrawAndBridge`.
-    ///         The owner drains a specific vault's accumulated shares via `sweep(vault, to)`.
+    ///         The owner drains a specific vault's accumulated shares via `sweep(token, amount)`.
     mapping(address => uint256) public heldFeeShares;
 
     // -------------------------------------------------------------------------
@@ -132,7 +134,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         uint256 usdcAmount
     );
 
-    /// @notice Emitted when `batchDeposit` completes, summarising a new multi-vault strategy.
+    /// @notice Emitted when `selfBatchDeposit` completes, summarising a new multi-vault strategy.
     /// @param user       The user who created the strategy.
     /// @param totalUsdc  Total USDC pulled from the user in one transfer.
     event StrategyCreated(
@@ -222,11 +224,6 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
 
     /// @notice Thrown when the low-level call to the CCTP TokenMessenger's `depositForBurn` fails.
     error CctpBurnFailed();
-
-    /// @notice Thrown when the contract holds less USDC than required for a bridge deposit.
-    /// @param have Current USDC balance of the contract.
-    /// @param need Required USDC amount.
-    error InsufficientContractBalance(uint256 have, uint256 need);
 
     /// @notice Thrown when the CCTP `receiveMessage` relay call returns false.
     error MessageRelayFailed();
@@ -371,6 +368,8 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @dev Transfer vault shares from `user` to this contract as a performance fee.
+    ///      Only ERC4626 (Morpho) vaults are supported here — Aave fees use aUSDC and
+    ///      are handled inline by `selfBatchWithdraw`. Each fee vault must be whitelisted.
     ///      `feeVaults` may contain vaults unrelated to the current `fromVault`/`toVault`
     ///      pair — the executor collects fees from ALL strategy vaults with accrued yield
     ///      in a single call to amortise gas. Reverts if array lengths differ.
@@ -383,9 +382,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
         if (feeVaults.length == 0) return;
         for (uint256 i = 0; i < feeVaults.length; i++) {
-            if (!approvedVaults[feeVaults[i]] && feeVaults[i] != aavePool) {
-                revert VaultNotApproved(feeVaults[i]);
-            }
+            if (!approvedVaults[feeVaults[i]]) revert VaultNotApproved(feeVaults[i]);
             IERC20(feeVaults[i]).safeTransferFrom(user, address(this), feeAmounts[i]);
             heldFeeShares[feeVaults[i]] += feeAmounts[i];
         }
@@ -406,8 +403,8 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     ///      The user must have pre-approved this contract to spend their `fromVault` token
     ///      (ERC4626 shares or aUSDC) and any fee vault tokens before the rebalancer calls this.
     /// @param user       The user whose position is being rebalanced.
-    /// @param fromVault  The vault to withdraw from. Must be whitelisted.
-    /// @param toVault    The vault to deposit into. Must be whitelisted.
+    /// @param fromVault  The vault to withdraw from. Must be whitelisted and differ from `toVault`.
+    /// @param toVault    The vault to deposit into. Must be whitelisted and differ from `fromVault`.
     /// @param shares     ERC4626 shares (Morpho) or aUSDC amount (Aave) to move.
     /// @param feeVaults  Vault addresses from which to collect performance fee shares.
     ///                   May be empty (no fee) or contain vaults outside the rebalance pair.
@@ -423,6 +420,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         if (user == address(0)) revert ZeroAddress();
         if (!approvedVaults[fromVault]) revert VaultNotApproved(fromVault);
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
+        if (fromVault == toVault) revert InvalidInput();
         if (shares == 0) revert ZeroAmount();
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
@@ -432,7 +430,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         uint256 usdcReceived;
         if (fromVault == aavePool) {
             IERC20(aUsdc).safeTransferFrom(user, address(this), shares);
-            usdcReceived = IPool(aavePool).withdraw(address(usdc), type(uint256).max, address(this));
+            usdcReceived = IPool(aavePool).withdraw(address(usdc), shares, address(this));
         } else {
             IERC20(fromVault).safeTransferFrom(user, address(this), shares);
             usdcReceived = IERC4626(fromVault).redeem(shares, address(this), address(this));
@@ -502,7 +500,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         // --- Withdrawal ---
         if (vault == aavePool) {
             IERC20(aUsdc).safeTransferFrom(user, address(this), shares);
-            netUsdc = IPool(aavePool).withdraw(address(usdc), type(uint256).max, address(this));
+            netUsdc = IPool(aavePool).withdraw(address(usdc), shares, address(this));
         } else {
             IERC20(vault).safeTransferFrom(user, address(this), shares);
             netUsdc = IERC4626(vault).redeem(shares, address(this), address(this));
@@ -526,42 +524,6 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         if (!success) revert CctpBurnFailed();
 
         emit BridgeInitiated(user, vault, shares, netUsdc, destDomain);
-    }
-
-    // -------------------------------------------------------------------------
-    // Owner-only: Deposit bridged USDC into a vault
-    // -------------------------------------------------------------------------
-
-    /// @notice Deposit USDC that was minted to this contract via CCTP into a vault.
-    /// @dev No USDC approval from the user is needed because the USDC is already
-    ///      in this contract (it was minted here by the CCTP MessageTransmitter).
-    ///      Use this when bridging and depositing are handled in separate transactions
-    ///      (e.g. the relay was done externally). For an atomic relay+deposit, use
-    ///      `relayAndDeposit` instead.
-    /// @param user       The user who will receive vault shares or aTokens.
-    /// @param vault      Whitelisted destination vault or `aavePool`.
-    /// @param usdcAmount Amount of USDC already in the contract to deposit.
-    function depositFromBridge(
-        address user,
-        address vault,
-        uint256 usdcAmount
-    ) external onlyOwner nonReentrant {
-        if (user == address(0)) revert ZeroAddress();
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
-        if (usdcAmount == 0) revert ZeroAmount();
-
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance < usdcAmount) revert InsufficientContractBalance(balance, usdcAmount);
-
-        if (vault == aavePool) {
-            usdc.forceApprove(aavePool, usdcAmount);
-            IPool(aavePool).supply(address(usdc), usdcAmount, user, 0);
-            emit DepositedFromBridge(user, vault, usdcAmount, usdcAmount);
-        } else {
-            usdc.forceApprove(vault, usdcAmount);
-            uint256 sharesReceived = IERC4626(vault).deposit(usdcAmount, user);
-            emit DepositedFromBridge(user, vault, usdcAmount, sharesReceived);
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -623,9 +585,9 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Deposit USDC from `msg.sender` into multiple vaults in one transaction.
-    /// @dev User-callable (no `onlyOwner`). Mirrors `batchDeposit` but uses `msg.sender`
-    ///      instead of a `user` parameter, allowing users to initiate their own deposits
-    ///      and pay their own gas. The user must have pre-approved this contract to spend
+    /// @dev User-callable (no `onlyOwner`). Uses `msg.sender` as the depositor,
+    ///      allowing users to initiate their own deposits and pay their own gas.
+    ///      The user must have pre-approved this contract to spend
     ///      at least `sum(amounts)` USDC before calling.
     ///      Works for both Morpho ERC4626 vaults and the Aave V3 Pool.
     ///      Emits `StrategyCreated` at the end with total USDC, making it easy for
@@ -676,7 +638,8 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     ///      the remainder to msg.sender as USDC.
     ///      `feeAmounts[i]` must be < `shares[i]`. Pass 0 for vaults with no fee.
     ///      Vaults where the effective amount resolves to zero are silently skipped.
-    ///      Aave path: `shares[i]` is treated as aUSDC amount; fees are ignored for Aave.
+    ///      Aave path: `shares[i]` is treated as aUSDC amount. Fee shares for Aave are
+    ///      tracked under the `aUsdc` token address in `heldFeeShares` (not `aavePool`).
     /// @param vaults     Vault addresses to withdraw from. Each must be whitelisted.
     /// @param shares     Gross share amounts per vault (0 = full balance).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
@@ -703,14 +666,14 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
                 uint256 feeAmt = feeAmounts[i];
                 if (feeAmt > 0) {
                     if (feeAmt >= amt) revert InvalidInput();
-                    heldFeeShares[aavePool] += feeAmt;
+                    heldFeeShares[aUsdc] += feeAmt;
                     amt -= feeAmt;
-                    feeVaultsEmitted[feeCount] = aavePool;
+                    feeVaultsEmitted[feeCount] = aUsdc;
                     feeAmountsEmitted[feeCount] = feeAmt;
                     feeCount++;
                 }
                 uint256 usdcReceived = IPool(aavePool).withdraw(address(usdc), amt, msg.sender);
-                emit StrategyExited(msg.sender, vault, shares[i], usdcReceived);
+                emit StrategyExited(msg.sender, vault, amt, usdcReceived);
             } else {
                 uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
                 if (amt == 0) continue;
@@ -725,7 +688,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
                     feeCount++;
                 }
                 uint256 usdcReceived = IERC4626(vault).redeem(amt, msg.sender, address(this));
-                emit StrategyExited(msg.sender, vault, shares[i], usdcReceived);
+                emit StrategyExited(msg.sender, vault, amt, usdcReceived);
             }
         }
 
@@ -741,20 +704,18 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     // Owner-only: Fee management
     // -------------------------------------------------------------------------
 
-    /// @notice Sweep accumulated fee tokens (or any ERC20) to a recipient.
-    /// @dev Transfers the contract's entire balance of `token` in one call.
-    ///      If `to` is `address(0)`, funds are sent to `owner()`.
-    ///      Can sweep any ERC20, not just USDC — use this to drain accumulated vault
-    ///      share fees tracked in `heldFeeShares`, or to recover accidentally sent tokens.
-    /// @param token The ERC20 token to sweep.
-    /// @param to    Recipient address. Pass `address(0)` to use the current `owner()`.
-    function sweep(address token, address to) external onlyOwner {
-        address recipient = to == address(0) ? owner() : to;
-        uint256 amount = IERC20(token).balanceOf(address(this));
-        if (amount == 0) return;
-        heldFeeShares[token] = 0;
-        IERC20(token).safeTransfer(recipient, amount);
-        emit FeeSwept(token, recipient, amount);
+    /// @notice Sweep a specific amount of an ERC20 token to the owner.
+    /// @dev Use this to drain accumulated vault share fees tracked in `heldFeeShares`,
+    ///      or to recover accidentally sent tokens. Decrements `heldFeeShares` bookkeeping
+    ///      by up to `amount` (capped at the tracked balance to avoid underflow).
+    /// @param token  The ERC20 token to sweep.
+    /// @param amount The amount to transfer to the owner.
+    function sweep(address token, uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroAmount();
+        uint256 held = heldFeeShares[token];
+        heldFeeShares[token] = held > amount ? held - amount : 0;
+        IERC20(token).safeTransfer(owner(), amount);
+        emit FeeSwept(token, owner(), amount);
     }
 
     // -------------------------------------------------------------------------

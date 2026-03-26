@@ -23,7 +23,7 @@ Step-by-step instructions to deploy Yield Rebalancer from scratch.
 forge build --no-cache   # --no-cache ensures the artifact reflects latest source changes
 ```
 
-Verify: `out/YieldRebalancer.sol/YieldRebalancer.json` exists and the `batchWithdraw` ABI entry has 3 inputs (`user`, `vaults`, `shares`).
+Verify: `out/YieldRebalancer.sol/YieldRebalancer.json` exists and contains the `selfBatchWithdraw` ABI entry.
 
 ### Deploy (CreateX CREATE3 — deterministic address)
 
@@ -63,9 +63,9 @@ The script logs `Deployed: <addr>` — that is the correct address.
 3. Verify and add vaults for each chain (next section)
 
 **Bumping the salt version** (required when re-deploying to new address):
-Edit `script/Deploy.s.sol` — change `uint96(3)` to `uint96(4)` (or next unused version):
+Edit `script/Deploy.s.sol` — increment `uint96(N)` to the next unused version:
 ```solidity
-bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(4))));
+bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(N))));
 ```
 **Never reuse a version** — the proxy at the old CREATE2 address persists on-chain with nonce > 0, making the same-version salt unusable.
 
