@@ -17,5 +17,5 @@ base = "${BASE_RPC_URL}"
 monad = "${MONAD_RPC_URL}"
 
 [etherscan]
-base = { key = "${BASESCAN_API_KEY}", url = "https://api.etherscan.io/v2/api?chainid=8453" }
-monad = { key = "${BASESCAN_API_KEY}", url = "https://api.etherscan.io/v2/api?chainid=143" }
+base = { key = "${ETHERSCAN_API_KEY}", url = "https://api.etherscan.io/v2/api?chainid=8453" }
+monad = { key = "${ETHERSCAN_API_KEY}", url = "https://api.etherscan.io/v2/api?chainid=143" }

@@ -45,14 +45,30 @@ The contract detects the Aave path by comparing the vault address to the immutab
 
 ## Cross-Chain (CCTP V2)
 
-Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC between chains:
+Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC between chains.
+
+### Owner-callable (rebalancer-initiated)
 
 - **`withdrawAndBridge()`** — Atomically withdraws from a vault, collects performance fees as vault shares, and burns USDC via `ITokenMessengerV2.depositForBurn`. USDC exists in the contract for only a single transaction.
-- **`relayAndDeposit()`** — Relays a CCTP attestation (minting USDC to this contract) and immediately deposits into a vault. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
+- **`relayAndDeposit()`** — Relays a CCTP attestation (minting USDC to this contract) and immediately deposits into a single vault. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
+- **`relayAndBatchDeposit()`** — Same as `relayAndDeposit` but splits the minted USDC across multiple vaults. Used when a single burn aggregates capital for multiple destination vaults.
 
-**MEV protection:** Setting `destinationCaller = address(this)` (as bytes32) at burn time on the source chain ensures only this contract can relay on the destination, preventing MEV bots from front-running the mint.
+### User-callable (self-service burns)
 
-**Low-level call:** `withdrawAndBridge` uses a low-level `call` to the CCTP TokenMessenger instead of a typed interface call because some CCTP deployments are behind upgradeable proxies whose return-value encoding differs from the ABI; a direct interface call would revert on return-data decoding even when the underlying call succeeds.
+- **`selfBatchDeposit(vaults[], amounts[], burns[])`** — Deposits USDC into local vaults AND optionally burns USDC via CCTP for cross-chain deposits, all in one transaction. Each `BridgeBurn` entry specifies a destination domain, recipient, and amount. The relayer picks up burns and calls `relayAndDeposit`/`relayAndBatchDeposit` on the destination chain.
+- **`selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])`** — Closes vault positions AND optionally burns redeemed USDC via CCTP to bridge back to the user's source chain. When `burns` is non-empty, redeemed USDC is accumulated in the contract and burned. Pass `type(uint256).max` as `burns[i].amount` to burn all redeemed USDC after fees (recommended for close flows). Any remainder after burns is transferred to `msg.sender`. For withdrawal burns, `destinationCaller` is typically `bytes32(0)` (permissionless relay), allowing Circle's auto-relay service to handle the relay within ~1 minute at no gas cost.
+
+### Finality thresholds
+
+The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle issues the attestation:
+- **`0`** — Fast finality: attestation issued after minimal block confirmations (~8-20 seconds depending on chain).
+- **`2000`** — Standard finality: attestation issued after full chain finality (~13-15 minutes on Ethereum, varies by chain).
+
+### Design notes
+
+**MEV protection:** Setting `destinationCaller = address(this)` (as bytes32) at burn time on the source chain ensures only this contract can relay on the destination, preventing MEV bots from front-running the mint. For withdrawal burns (bridge-back on close), `destinationCaller = bytes32(0)` is used instead, allowing permissionless relay — this enables Circle's auto-relay service to handle the relay automatically.
+
+**Low-level call:** All CCTP burn calls use a low-level `call` to the TokenMessenger instead of a typed interface call because some CCTP deployments are behind upgradeable proxies whose return-value encoding differs from the ABI; a direct interface call would revert on return-data decoding even when the underlying call succeeds.
 
 ---
 
@@ -65,7 +81,8 @@ Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC b
 | `deposit(user, vault, usdcAmount)` | Pull USDC from user, deposit into vault |
 | `rebalance(user, fromVault, toVault, shares, feeVaults[], feeAmounts[])` | Move position between vaults with optional performance fee collection |
 | `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], tokenMessenger, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
-| `relayAndDeposit(message, attestation, user, vault)` | Atomic CCTP relay + vault deposit |
+| `relayAndDeposit(message, attestation, user, vault)` | Atomic CCTP relay + single vault deposit |
+| `relayAndBatchDeposit(message, attestation, user, vaults[], amounts[])` | Atomic CCTP relay + multi-vault deposit |
 | `addVault(vault)` | Add vault to whitelist |
 | `batchAddVaults(vaults[])` | Add multiple vaults to whitelist |
 | `removeVault(vault)` | Remove vault from whitelist |
@@ -75,8 +92,8 @@ Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC b
 
 | Function | Description |
 | --- | --- |
-| `selfBatchDeposit(vaults[], amounts[])` | Deposit USDC into multiple vaults in one transaction (pulls total USDC in a single transfer) |
-| `selfBatchWithdraw(vaults[], shares[], feeAmounts[])` | Close vault positions with optional per-vault fee deduction, USDC returned to caller |
+| `selfBatchDeposit(vaults[], amounts[], burns[])` | Deposit USDC into local vaults + optionally burn via CCTP for cross-chain deposits |
+| `selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])` | Close vault positions with per-vault fee deduction + optionally burn via CCTP to bridge back to source chain |
 
 ### View
 
@@ -136,7 +153,8 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 | `PerformanceFeeCollected(user, vaults[], amounts[])` | `rebalance`, `selfBatchWithdraw`, `withdrawAndBridge` (via `_collectFees`) |
 | `FeeSwept(token, recipient, amount)` | `sweep` |
 | `BridgeInitiated(user, vault, shares, usdcBurned, destDomain)` | `withdrawAndBridge` |
-| `DepositedFromBridge(user, vault, usdcAmount, sharesReceived)` | `relayAndDeposit` |
+| `BridgeBurnInitiated(user, amount, destDomain, mintRecipient)` | `selfBatchDeposit`, `selfBatchWithdraw` (CCTP burns) |
+| `DepositedFromBridge(user, vault, usdcAmount, sharesReceived)` | `relayAndDeposit`, `relayAndBatchDeposit` |
 
 ---
 
@@ -156,16 +174,18 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 
 ---
 
-## Constructor
+## Constructor & Initializer
+
+The contract is deployed behind a **UUPS proxy**. The constructor sets immutables only; storage-based state is set via `initialize()` through the proxy.
+
+### Constructor (implementation)
 
 ```solidity
 constructor(
     address _usdc,
     address _aavePool,
     address _aUsdc,
-    address _messageTransmitter,
-    address _owner,
-    address[] memory _initialVaults
+    address _messageTransmitter
 )
 ```
 
@@ -175,6 +195,15 @@ constructor(
 | `_aavePool` | No | Aave V3 Pool address. `address(0)` on chains without Aave. |
 | `_aUsdc` | No | Aave aUSDC token address. `address(0)` on chains without Aave. |
 | `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
+
+### Initializer (called once through proxy)
+
+```solidity
+function initialize(address _owner, address[] calldata _initialVaults)
+```
+
+| Parameter | Required | Description |
+| --- | --- | --- |
 | `_owner` | Yes | Initial owner (rebalancer EOA). Reverts on `address(0)`. |
 | `_initialVaults` | No | Optional vault whitelist seeded at deploy time. Duplicates and zero addresses are silently skipped. |
 
@@ -250,12 +279,14 @@ The Hardhat test suite (`test/YieldRebalancer.test.ts`) uses a local Hardhat net
 
 ## Deployed Addresses
 
-| Chain | Address | Version | Deployed |
-| --- | --- | --- | --- |
-| Base (8453) | [`0x3124F026970C322DdCb017EAa667b7d50A42c5Cc`](https://basescan.org/address/0x3124F026970C322DdCb017EAa667b7d50A42c5Cc) | v10 | 2026-03-26 |
-| Monad (143) | `0x3124F026970C322DdCb017EAa667b7d50A42c5Cc` | v10 | 2026-03-26 |
+**UUPS Proxy (permanent, same on all chains):** `0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`
 
-Both chains use the same deterministic address via CreateX CREATE3 (salt version 10).
+| Chain | Proxy | Implementation | Version | Deployed |
+| --- | --- | --- | --- | --- |
+| Base (8453) | [`0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`](https://basescan.org/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | `0x9B4a3541aCBbF210aa50610477F39a83B84d3adA` | v12 | 2026-04-02 |
+| Monad (143) | [`0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`](https://monadscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | `0x3B53652255aCeE7D0F7d5814dC6b784bD465d2fB` | v12 | 2026-04-02 |
+
+The proxy address is deterministic via CreateX CREATE3 (salt version 11) and never changes. Upgrades deploy a new implementation and call `upgradeToAndCall` on the proxy.
 
 ---
 

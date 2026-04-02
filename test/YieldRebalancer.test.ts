@@ -1,10 +1,47 @@
 import hre from "hardhat";
 import { expect } from "chai";
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
-import { getAddress, parseUnits } from "viem";
+import { getAddress, parseUnits, encodeFunctionData } from "viem";
 
 describe("YieldRebalancer", function () {
   const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+  /**
+   * Deploy YieldRebalancer behind an ERC1967 proxy (UUPS pattern).
+   * Returns a contract handle to the proxy using the YieldRebalancer ABI.
+   */
+  async function deployBehindProxy(
+    usdcAddr: `0x${string}`,
+    aavePool: `0x${string}`,
+    aUsdc: `0x${string}`,
+    msgTransmitter: `0x${string}`,
+    ownerAddr: `0x${string}`,
+    initialVaults: `0x${string}`[],
+  ) {
+    // 1. Deploy implementation (immutables set in constructor)
+    const impl = await hre.viem.deployContract("YieldRebalancer", [
+      usdcAddr,
+      aavePool,
+      aUsdc,
+      msgTransmitter,
+    ]);
+
+    // 2. Encode initialize() calldata
+    const initData = encodeFunctionData({
+      abi: impl.abi,
+      functionName: "initialize",
+      args: [ownerAddr, initialVaults],
+    });
+
+    // 3. Deploy ERC1967Proxy wrapping the implementation
+    const proxy = await hre.viem.deployContract("ERC1967Proxy", [
+      impl.address,
+      initData,
+    ]);
+
+    // 4. Return a contract handle to the proxy using the YieldRebalancer ABI
+    return await hre.viem.getContractAt("YieldRebalancer", proxy.address);
+  }
 
   async function deployFixture() {
     const [owner, user, other] = await hre.viem.getWalletClients();
@@ -29,17 +66,17 @@ describe("YieldRebalancer", function () {
       "vB",
     ]);
 
-    // Deploy YieldRebalancer
+    // Deploy YieldRebalancer behind proxy
     // Use owner address as placeholder for aavePool/aUsdc (not exercised in non-Aave tests)
     // address(0) for messageTransmitter — CCTP not exercised in these tests
-    const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
+    const rebalancer = await deployBehindProxy(
       usdc.address,
       owner.account.address, // aavePool placeholder
       owner.account.address, // aUsdc placeholder
-      ZERO_ADDRESS,          // messageTransmitter (disabled)
+      ZERO_ADDRESS as `0x${string}`,          // messageTransmitter (disabled)
       owner.account.address, // owner
       [],                    // initialVaults
-    ]);
+    );
 
     // Mint USDC to user
     const mintAmount = parseUnits("10000", 6); // 10,000 USDC
@@ -93,46 +130,43 @@ describe("YieldRebalancer", function () {
     });
 
     it("should revert on zero USDC address", async function () {
-      const [owner] = await hre.viem.getWalletClients();
       await expect(
         hre.viem.deployContract("YieldRebalancer", [
           ZERO_ADDRESS,
-          owner.account.address,
-          owner.account.address,
           ZERO_ADDRESS,
-          owner.account.address,
-          [],
+          ZERO_ADDRESS,
+          ZERO_ADDRESS,
         ])
       ).to.be.rejectedWith("ZeroAddress");
     });
 
-    it("should revert on zero owner address", async function () {
+    it("should revert on zero owner in initialize", async function () {
       const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       await expect(
-        hre.viem.deployContract("YieldRebalancer", [
+        deployBehindProxy(
           usdc.address,
-          owner.account.address,
-          owner.account.address,
-          ZERO_ADDRESS,
-          ZERO_ADDRESS,
+          ZERO_ADDRESS as `0x${string}`,
+          ZERO_ADDRESS as `0x${string}`,
+          ZERO_ADDRESS as `0x${string}`,
+          ZERO_ADDRESS as `0x${string}`,
           [],
-        ])
-      ).to.be.rejectedWith("OwnableInvalidOwner");
+        )
+      ).to.be.rejectedWith("ZeroAddress");
     });
 
-    it("should seed initial vaults from constructor", async function () {
+    it("should seed initial vaults via initialize", async function () {
       const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
-      const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
+      const rebalancer = await deployBehindProxy(
         usdc.address,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
+        ZERO_ADDRESS as `0x${string}`,
+        ZERO_ADDRESS as `0x${string}`,
+        ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
         [vault.address],
-      ]);
+      );
       expect(await rebalancer.read.isVaultApproved([vault.address])).to.be.true;
       const vaults = await rebalancer.read.getApprovedVaults();
       expect(vaults.length).to.equal(1);
@@ -142,14 +176,14 @@ describe("YieldRebalancer", function () {
       const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
-      const rebalancer = await hre.viem.deployContract("YieldRebalancer", [
+      const rebalancer = await deployBehindProxy(
         usdc.address,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
+        ZERO_ADDRESS as `0x${string}`,
+        ZERO_ADDRESS as `0x${string}`,
+        ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
-        [vault.address, ZERO_ADDRESS, vault.address], // dup + zero
-      ]);
+        [vault.address, ZERO_ADDRESS as `0x${string}`, vault.address], // dup + zero
+      );
       const vaults = await rebalancer.read.getApprovedVaults();
       expect(vaults.length).to.equal(1);
     });
@@ -597,6 +631,7 @@ describe("YieldRebalancer", function () {
       await rebalancerAsUser.write.selfBatchDeposit([
         [vaultA.address, vaultB.address],
         [amountA, amountB],
+        [],
       ]);
 
       // User should have shares in both vaults
@@ -631,6 +666,7 @@ describe("YieldRebalancer", function () {
         rebalancerAsUser.write.selfBatchDeposit([
           [vaultA.address],
           [amount],
+          [],
         ])
       ).to.be.rejectedWith("VaultNotApproved");
     });
@@ -648,6 +684,7 @@ describe("YieldRebalancer", function () {
         rebalancerAsUser.write.selfBatchDeposit([
           [vaultA.address],
           [parseUnits("100", 6), parseUnits("200", 6)],
+          [],
         ])
       ).to.be.rejectedWith("InvalidInput");
     });
@@ -661,7 +698,7 @@ describe("YieldRebalancer", function () {
         { client: { wallet: user } }
       );
       await expect(
-        rebalancerAsUser.write.selfBatchDeposit([[], []])
+        rebalancerAsUser.write.selfBatchDeposit([[], [], []])
       ).to.be.rejectedWith("InvalidInput");
     });
 
@@ -678,6 +715,7 @@ describe("YieldRebalancer", function () {
         rebalancerAsUser.write.selfBatchDeposit([
           [vaultA.address],
           [0n],
+          [],
         ])
       ).to.be.rejectedWith("ZeroAmount");
     });
@@ -711,6 +749,7 @@ describe("YieldRebalancer", function () {
       await rebalancerAsUser.write.selfBatchDeposit([
         [vaultA.address, vaultB.address],
         [amountA, amountB],
+        [],
       ]);
 
       const sharesA = await vaultA.read.balanceOf([user.account.address]);

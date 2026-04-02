@@ -6,6 +6,8 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
 /// @dev Minimal Aave V3 Pool interface for supply/withdraw
 interface IPool {
@@ -29,6 +31,19 @@ interface ITokenMessengerV2 {
         uint256 maxFee,
         uint32 minFinalityThreshold
     ) external returns (bytes32);
+}
+
+/// @notice Parameters for a single CCTP V2 cross-chain burn within `selfBatchDeposit`
+///         and `selfBatchWithdraw` (bridge-back on close).
+/// @dev All fields are value types so the struct is calldata-safe.
+struct BridgeBurn {
+    address tokenMessenger;       // CCTP V2 TokenMessenger contract address
+    uint32  destDomain;           // CCTP destination domain (e.g. 6 = Base, 15 = Monad)
+    bytes32 mintRecipient;        // bytes32-padded address to receive minted USDC on dest chain
+    bytes32 destinationCaller;    // bytes32-padded address permitted to relay on dest chain (MEV protection)
+    uint256 amount;               // USDC amount to burn for this destination
+    uint256 maxFee;               // Maximum fee the CCTP protocol may charge (0 for standard)
+    uint32  minFinalityThreshold; // 0 = fast finality (seconds), 2000 = standard finality (full chain finality)
 }
 
 /// @title YieldRebalancer
@@ -59,7 +74,7 @@ interface ITokenMessengerV2 {
 ///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
 ///        with no owner requirement, providing a trustless exit path independent of
 ///        the rebalancer.
-contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
+contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
@@ -202,6 +217,20 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         uint256 sharesReceived
     );
 
+    /// @notice Emitted for each CCTP burn in `selfBatchDeposit` when bridging USDC cross-chain.
+    /// @dev Separate from `BridgeInitiated` because no vault withdrawal is involved —
+    ///      raw USDC is burned directly from the user's deposit.
+    /// @param user          The user who initiated the deposit+bridge.
+    /// @param amount        USDC burned via CCTP.
+    /// @param destDomain    CCTP destination domain ID.
+    /// @param mintRecipient bytes32-padded address receiving minted USDC on dest chain.
+    event BridgeBurnInitiated(
+        address indexed user,
+        uint256 amount,
+        uint32  destDomain,
+        bytes32 mintRecipient
+    );
+
     // -------------------------------------------------------------------------
     // Errors
     // -------------------------------------------------------------------------
@@ -229,39 +258,55 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     error MessageRelayFailed();
 
     // -------------------------------------------------------------------------
-    // Constructor
+    // Constructor (implementation only — sets immutables, disables initializers)
     // -------------------------------------------------------------------------
 
-    /// @notice Deploy YieldRebalancer.
-    /// @dev Sets all immutable addresses and optionally seeds the vault whitelist.
-    ///      The deployer passes `address(0)` for `_aavePool`, `_aUsdc`, and
-    ///      `_messageTransmitter` on chains where those integrations are not available.
-    ///      Only `_usdc` and `_owner` must be non-zero.
+    /// @notice Deploy the YieldRebalancer implementation.
+    /// @dev Sets immutable addresses baked into bytecode. Storage-based state (owner,
+    ///      vault whitelist) is set via `initialize()` through the proxy.
+    ///      `_disableInitializers()` prevents the implementation from being initialized
+    ///      directly — only the proxy should call `initialize()`.
+    ///      `Ownable(msg.sender)` is a dummy value required by the constructor; the real
+    ///      owner is set in `initialize()` via `_transferOwnership()`.
     /// @param _usdc               USDC token address.
     /// @param _aavePool           Aave V3 Pool address; `address(0)` if Aave not on chain.
     /// @param _aUsdc              Aave aUSDC token address; `address(0)` if Aave not on chain.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
-    /// @param _owner              Initial owner (rebalancer EOA). Receives all owner privileges.
-    /// @param _initialVaults      Optional list of vaults to whitelist atomically at deploy time.
-    ///                            Duplicates and zero addresses are silently skipped.
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(
         address _usdc,
         address _aavePool,
         address _aUsdc,
-        address _messageTransmitter,
-        address _owner,
-        address[] memory _initialVaults
-    ) Ownable(_owner) {
-        if (_usdc  == address(0)) revert ZeroAddress();
-        // _aavePool, _aUsdc, _messageTransmitter may be zero on chains without those integrations
-        if (_owner == address(0)) revert ZeroAddress();
+        address _messageTransmitter
+    ) Ownable(msg.sender) {
+        if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
         aavePool           = _aavePool;
         aUsdc              = _aUsdc;
         messageTransmitter = _messageTransmitter;
 
-        // Pre-populate whitelist
+        _disableInitializers();
+    }
+
+    // -------------------------------------------------------------------------
+    // Initializer (called once through proxy)
+    // -------------------------------------------------------------------------
+
+    /// @notice Initialize storage-based state through the proxy.
+    /// @dev Called exactly once by the ERC1967Proxy constructor. Sets the real owner
+    ///      and optionally seeds the vault whitelist. Subsequent upgrades preserve
+    ///      storage and do NOT re-run this function.
+    /// @param _owner         Initial owner (rebalancer EOA). Receives all owner privileges.
+    /// @param _initialVaults Optional list of vaults to whitelist atomically.
+    ///                       Duplicates and zero addresses are silently skipped.
+    function initialize(
+        address _owner,
+        address[] calldata _initialVaults
+    ) external initializer {
+        if (_owner == address(0)) revert ZeroAddress();
+        _transferOwnership(_owner);
+
         for (uint256 i = 0; i < _initialVaults.length; i++) {
             address vault = _initialVaults[i];
             if (vault != address(0) && !approvedVaults[vault]) {
@@ -474,7 +519,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     /// @param destinationCaller     bytes32-padded address permitted to relay on dest chain.
     ///                              Set to `address(0)` to allow anyone to relay (no MEV protection).
     /// @param maxFee                Maximum fee the CCTP protocol may charge (0 for standard).
-    /// @param minFinalityThreshold  Minimum finality threshold (2000 = standard fast finality).
+    /// @param minFinalityThreshold  0 = fast finality (seconds), 2000 = standard finality (full chain finality).
     /// @return netUsdc              USDC burned via CCTP.
     function withdrawAndBridge(
         address user,
@@ -580,25 +625,84 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         }
     }
 
+    /// @notice Relay a CCTP message, then split the minted USDC across multiple vaults.
+    /// @dev Used when a single bridge burn aggregates capital destined for multiple vaults
+    ///      on this chain. The relayer calls this instead of relayAndDeposit when dest_vaults
+    ///      contains more than one entry.
+    function relayAndBatchDeposit(
+        bytes calldata message,
+        bytes calldata attestation,
+        address user,
+        address[] calldata vaults,
+        uint256[] calldata amounts
+    ) external onlyOwner nonReentrant {
+        if (user == address(0)) revert ZeroAddress();
+        if (vaults.length != amounts.length) revert InvalidInput();
+        if (vaults.length == 0) revert InvalidInput();
+        if (messageTransmitter == address(0)) revert ZeroAddress();
+
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (amounts[i] == 0) revert ZeroAmount();
+        }
+
+        // Step 1: Snapshot USDC balance before relay
+        uint256 before = usdc.balanceOf(address(this));
+
+        // Step 2: Relay the CCTP message — USDC minted to this contract
+        bool success = IMessageTransmitter(messageTransmitter).receiveMessage(message, attestation);
+        if (!success) revert MessageRelayFailed();
+
+        // Step 3: Verify minted amount covers all allocations
+        uint256 minted = usdc.balanceOf(address(this)) - before;
+        uint256 totalNeeded = 0;
+        for (uint256 i = 0; i < amounts.length; i++) {
+            totalNeeded += amounts[i];
+        }
+        if (minted < totalNeeded) revert ZeroAmount();
+
+        // Step 4: Deposit into each vault on behalf of user
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (vaults[i] == aavePool) {
+                usdc.forceApprove(aavePool, amounts[i]);
+                IPool(aavePool).supply(address(usdc), amounts[i], user, 0);
+                emit DepositedFromBridge(user, vaults[i], amounts[i], amounts[i]);
+            } else {
+                usdc.forceApprove(vaults[i], amounts[i]);
+                uint256 sharesReceived = IERC4626(vaults[i]).deposit(amounts[i], user);
+                emit DepositedFromBridge(user, vaults[i], amounts[i], sharesReceived);
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // User-callable: Batch Deposits
     // -------------------------------------------------------------------------
 
-    /// @notice Deposit USDC from `msg.sender` into multiple vaults in one transaction.
+    /// @notice Deposit USDC from `msg.sender` into multiple vaults and optionally burn
+    ///         USDC cross-chain via CCTP V2, all in one transaction.
     /// @dev User-callable (no `onlyOwner`). Uses `msg.sender` as the depositor,
     ///      allowing users to initiate their own deposits and pay their own gas.
-    ///      The user must have pre-approved this contract to spend
-    ///      at least `sum(amounts)` USDC before calling.
+    ///      The user must have pre-approved this contract to spend at least
+    ///      `sum(amounts) + sum(burns[i].amount)` USDC before calling.
     ///      Works for both Morpho ERC4626 vaults and the Aave V3 Pool.
-    ///      Emits `StrategyCreated` at the end with total USDC, making it easy for
-    ///      off-chain indexers to detect user-initiated strategy creation events.
-    /// @param vaults  Ordered list of vault addresses. Each must be whitelisted.
+    ///      When `burns` is empty, behaves identically to a single-chain deposit.
+    ///      When `burns` is non-empty, executes CCTP V2 `depositForBurn` for each entry,
+    ///      burning USDC on the source chain so it can be minted on the destination chain.
+    ///      The relayer picks up the burns and calls `relayAndDeposit` on the dest chain.
+    ///      Emits `StrategyCreated` at the end with total USDC (local + bridged).
+    /// @param vaults  Ordered list of vault addresses on the source chain. Each must be whitelisted.
+    ///                May be empty if all capital is bridged.
     /// @param amounts USDC amounts corresponding 1:1 with `vaults`. Each must be > 0.
+    /// @param burns   Array of CCTP burn parameters for cross-chain deposits.
+    ///                May be empty for single-chain deposits.
     function selfBatchDeposit(
         address[] calldata vaults,
-        uint256[] calldata amounts
+        uint256[] calldata amounts,
+        BridgeBurn[] calldata burns
     ) external nonReentrant {
-        if (vaults.length != amounts.length || vaults.length == 0) revert InvalidInput();
+        if (vaults.length != amounts.length) revert InvalidInput();
+        if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
 
         // Validate all vaults and compute total USDC needed
         uint256 total = 0;
@@ -607,11 +711,16 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
             if (amounts[i] == 0) revert ZeroAmount();
             total += amounts[i];
         }
+        for (uint256 i = 0; i < burns.length; i++) {
+            if (burns[i].amount == 0) revert ZeroAmount();
+            if (burns[i].tokenMessenger == address(0)) revert ZeroAddress();
+            total += burns[i].amount;
+        }
 
         // Pull total USDC from msg.sender in one transfer
         usdc.safeTransferFrom(msg.sender, address(this), total);
 
-        // Deposit into each vault
+        // Deposit into each local vault
         for (uint256 i = 0; i < vaults.length; i++) {
             if (vaults[i] == aavePool) {
                 usdc.forceApprove(aavePool, amounts[i]);
@@ -622,6 +731,27 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
                 uint256 sharesReceived = IERC4626(vaults[i]).deposit(amounts[i], msg.sender);
                 emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
             }
+        }
+
+        // Execute CCTP burns for cross-chain deposits
+        for (uint256 i = 0; i < burns.length; i++) {
+            usdc.forceApprove(burns[i].tokenMessenger, burns[i].amount);
+
+            (bool success, ) = burns[i].tokenMessenger.call(
+                abi.encodeWithSelector(
+                    ITokenMessengerV2.depositForBurn.selector,
+                    burns[i].amount,
+                    burns[i].destDomain,
+                    burns[i].mintRecipient,
+                    address(usdc),
+                    burns[i].destinationCaller,
+                    burns[i].maxFee,
+                    burns[i].minFinalityThreshold
+                )
+            );
+            if (!success) revert CctpBurnFailed();
+
+            emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
         }
 
         emit StrategyCreated(msg.sender, total);
@@ -640,16 +770,29 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
     ///      Vaults where the effective amount resolves to zero are silently skipped.
     ///      Aave path: `shares[i]` is treated as aUSDC amount. Fee shares for Aave are
     ///      tracked under the `aUsdc` token address in `heldFeeShares` (not `aavePool`).
+    ///      When `burns` is non-empty, redeemed USDC is accumulated in the contract and
+    ///      burned via CCTP to bridge back to the user's source chain. Any remainder
+    ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
+    ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
     /// @param vaults     Vault addresses to withdraw from. Each must be whitelisted.
     /// @param shares     Gross share amounts per vault (0 = full balance).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
+    /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
+    ///                   May be empty for single-chain withdrawals.
     function selfBatchWithdraw(
         address[] calldata vaults,
         uint256[] calldata shares,
-        uint256[] calldata feeAmounts
+        uint256[] calldata feeAmounts,
+        BridgeBurn[] calldata burns
     ) external nonReentrant {
         if (vaults.length == 0 || shares.length != vaults.length) revert InvalidInput();
         if (feeAmounts.length != vaults.length) revert ArrayLengthMismatch();
+
+        // When burns are present, USDC goes to the contract first (for CCTP burn).
+        // When burns are empty, USDC goes directly to the user (existing behavior).
+        bool hasBurns = burns.length > 0;
+        address usdcRecipient = hasBurns ? address(this) : msg.sender;
+        uint256 preBalance = hasBurns ? usdc.balanceOf(address(this)) : 0;
 
         address[] memory feeVaultsEmitted = new address[](vaults.length);
         uint256[] memory feeAmountsEmitted = new uint256[](vaults.length);
@@ -672,7 +815,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
                     feeAmountsEmitted[feeCount] = feeAmt;
                     feeCount++;
                 }
-                uint256 usdcReceived = IPool(aavePool).withdraw(address(usdc), amt, msg.sender);
+                uint256 usdcReceived = IPool(aavePool).withdraw(address(usdc), amt, usdcRecipient);
                 emit StrategyExited(msg.sender, vault, amt, usdcReceived);
             } else {
                 uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
@@ -687,7 +830,7 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
                     feeAmountsEmitted[feeCount] = feeAmt;
                     feeCount++;
                 }
-                uint256 usdcReceived = IERC4626(vault).redeem(amt, msg.sender, address(this));
+                uint256 usdcReceived = IERC4626(vault).redeem(amt, usdcRecipient, address(this));
                 emit StrategyExited(msg.sender, vault, amt, usdcReceived);
             }
         }
@@ -697,6 +840,42 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
             uint256[] memory fa = new uint256[](feeCount);
             for (uint256 i = 0; i < feeCount; i++) { fv[i] = feeVaultsEmitted[i]; fa[i] = feeAmountsEmitted[i]; }
             emit PerformanceFeeCollected(msg.sender, fv, fa);
+        }
+
+        // Execute CCTP burns for cross-chain bridge-back
+        if (hasBurns) {
+            uint256 netUsdc = usdc.balanceOf(address(this)) - preBalance;
+
+            for (uint256 i = 0; i < burns.length; i++) {
+                if (burns[i].tokenMessenger == address(0)) revert ZeroAddress();
+                uint256 burnAmount = burns[i].amount == type(uint256).max ? netUsdc : burns[i].amount;
+                if (burnAmount == 0) revert ZeroAmount();
+                if (burnAmount > netUsdc) revert InvalidInput();
+
+                usdc.forceApprove(burns[i].tokenMessenger, burnAmount);
+
+                (bool success, ) = burns[i].tokenMessenger.call(
+                    abi.encodeWithSelector(
+                        ITokenMessengerV2.depositForBurn.selector,
+                        burnAmount,
+                        burns[i].destDomain,
+                        burns[i].mintRecipient,
+                        address(usdc),
+                        burns[i].destinationCaller,
+                        burns[i].maxFee,
+                        burns[i].minFinalityThreshold
+                    )
+                );
+                if (!success) revert CctpBurnFailed();
+
+                emit BridgeBurnInitiated(msg.sender, burnAmount, burns[i].destDomain, burns[i].mintRecipient);
+                netUsdc -= burnAmount;
+            }
+
+            // Send any remainder to the user
+            if (netUsdc > 0) {
+                usdc.safeTransfer(msg.sender, netUsdc);
+            }
         }
     }
 
@@ -717,6 +896,13 @@ contract YieldRebalancer is Ownable2Step, ReentrancyGuard {
         IERC20(token).safeTransfer(owner(), amount);
         emit FeeSwept(token, owner(), amount);
     }
+
+    // -------------------------------------------------------------------------
+    // UUPS upgrade authorization
+    // -------------------------------------------------------------------------
+
+    /// @dev Only the owner can authorize an implementation upgrade.
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     // -------------------------------------------------------------------------
     // View functions
