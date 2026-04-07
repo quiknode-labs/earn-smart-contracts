@@ -25,6 +25,9 @@ contract DeployYieldRebalancer is Script {
     // Old v10 contract (non-proxy, deterministic address -used to seed initial vaults)
     address constant OLD_CONTRACT = 0x3124F026970C322DdCb017EAa667b7d50A42c5Cc;
 
+    // CCTP V2 MessageTransmitter — same deterministic address on every supported chain.
+    address constant MSG_TRANSMITTER = 0x81D40F21F12A8F0E3252Bccb954D722d4c464B64;
+
     // Per-chain constructor args (immutables baked into implementation bytecode)
     struct ChainConfig {
         address usdc;
@@ -34,22 +37,111 @@ contract DeployYieldRebalancer is Script {
     }
 
     function getConfig(uint32 chainId) internal pure returns (ChainConfig memory) {
-        if (chainId == 8453) { // Base
+        if (chainId == 1) { // Ethereum
             return ChainConfig({
-                usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
-                aavePool:        0xA238Dd80C259a72e81d7e4664a9801593F98d1c5,
-                aUsdc:           0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB,
-                msgTransmitter:  0x81D40F21F12A8F0E3252Bccb954D722d4c464B64
+                usdc:            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
+                aavePool:        0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2,
+                aUsdc:           0x98C23E9d8f34FEFb1B7BD6a91B7FF122F4e16F5c,
+                msgTransmitter:  MSG_TRANSMITTER
+            });
+        } else if (chainId == 10) { // Optimism (native USDC + USDCn aToken)
+            return ChainConfig({
+                usdc:            0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85,
+                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
+                aUsdc:           0x38d693cE1dF5AaDF7bC62595A37D667aD57922e5,
+                msgTransmitter:  MSG_TRANSMITTER
+            });
+        } else if (chainId == 130) { // Unichain — Morpho only
+            return ChainConfig({
+                usdc:            0x078D782b760474a361dDA0AF3839290b0EF57AD6,
+                aavePool:        address(0),
+                aUsdc:           address(0),
+                msgTransmitter:  MSG_TRANSMITTER
+            });
+        } else if (chainId == 137) { // Polygon (native USDC + USDCn aToken)
+            return ChainConfig({
+                usdc:            0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359,
+                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
+                aUsdc:           0xA4D94019934D8333Ef880ABFFbF2FDd611C762BD,
+                msgTransmitter:  MSG_TRANSMITTER
             });
         } else if (chainId == 143) { // Monad
             return ChainConfig({
                 usdc:            0x754704Bc059F8C67012fEd69BC8A327a5aafb603,
                 aavePool:        address(0),
                 aUsdc:           address(0),
-                msgTransmitter:  0x81D40F21F12A8F0E3252Bccb954D722d4c464B64
+                msgTransmitter:  MSG_TRANSMITTER
+            });
+        } else if (chainId == 8453) { // Base
+            return ChainConfig({
+                usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
+                aavePool:        0xA238Dd80C259a72e81d7e4664a9801593F98d1c5,
+                aUsdc:           0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB,
+                msgTransmitter:  MSG_TRANSMITTER
+            });
+        } else if (chainId == 42161) { // Arbitrum
+            return ChainConfig({
+                usdc:            0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
+                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
+                aUsdc:           0x724dc807b04555b71ed48a6896b6F41593b8C637,
+                msgTransmitter:  MSG_TRANSMITTER
             });
         }
         revert("Unsupported chain");
+    }
+
+    /// @notice Deploy a new implementation and the deterministic ERC1967 proxy,
+    ///         seeding the proxy with an explicit list of approved vaults via initialize().
+    ///         Use this for new chains where the v10 OLD_CONTRACT does not exist —
+    ///         the orchestration script (scripts/deploy-chain.ts) reads vaults from the
+    ///         approved_vaults Supabase table and passes them in as the second arg.
+    function runWithVaults(uint32 chainId, address[] calldata initialVaults) external {
+        ChainConfig memory cfg = getConfig(chainId);
+
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address deployer = vm.addr(deployerKey);
+
+        // Guarded salt: first 20 bytes = deployer, last 12 bytes = version 11
+        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(11))));
+
+        console.log("=== Deploy with explicit vaults ===");
+        console.log("Chain ID:        ", chainId);
+        console.log("Deployer:        ", deployer);
+        console.log("Initial vaults:  ", initialVaults.length);
+
+        vm.startBroadcast(deployerKey);
+
+        // Step 1: Deploy implementation (regular CREATE — address doesn't matter)
+        YieldRebalancer impl = new YieldRebalancer(
+            cfg.usdc,
+            cfg.aavePool,
+            cfg.aUsdc,
+            cfg.msgTransmitter
+        );
+        console.log("Implementation:  ", address(impl));
+
+        // Step 2: Deploy ERC1967Proxy via CreateX CREATE3 (deterministic address)
+        bytes memory initData = abi.encodeCall(
+            YieldRebalancer.initialize,
+            (deployer, initialVaults)
+        );
+
+        bytes memory proxyInitCode = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(address(impl), initData)
+        );
+
+        address proxy = ICreateX(CREATEX).deployCreate3(salt, proxyInitCode);
+
+        vm.stopBroadcast();
+
+        require(proxy != address(0), "Proxy deploy failed");
+
+        YieldRebalancer rebalancer = YieldRebalancer(proxy);
+        console.log("Proxy:           ", proxy);
+        console.log("Owner:           ", rebalancer.owner());
+        console.log("Vaults on chain: ", rebalancer.getApprovedVaults().length);
+        console.log("USDC:            ", address(rebalancer.usdc()));
     }
 
     /// @notice Deploy a new implementation and the deterministic ERC1967 proxy.
