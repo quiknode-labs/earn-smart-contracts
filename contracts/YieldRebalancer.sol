@@ -33,6 +33,29 @@ interface ITokenMessengerV2 {
     ) external returns (bytes32);
 }
 
+/// @dev Minimal Permit2 SignatureTransfer interface (Uniswap canonical deployment)
+interface ISignatureTransfer {
+    struct TokenPermissions {
+        address token;
+        uint256 amount;
+    }
+    struct PermitTransferFrom {
+        TokenPermissions permitted;
+        uint256 nonce;
+        uint256 deadline;
+    }
+    struct SignatureTransferDetails {
+        address to;
+        uint256 requestedAmount;
+    }
+    function permitTransferFrom(
+        PermitTransferFrom calldata permit,
+        SignatureTransferDetails calldata transferDetails,
+        address owner,
+        bytes calldata signature
+    ) external;
+}
+
 /// @notice Parameters for a single CCTP V2 cross-chain burn within `selfBatchDeposit`
 ///         and `selfBatchWithdraw` (bridge-back on close).
 /// @dev All fields are value types so the struct is calldata-safe.
@@ -76,6 +99,9 @@ struct BridgeBurn {
 ///        the rebalancer.
 contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
     using SafeERC20 for IERC20;
+
+    /// @notice Canonical Permit2 deployment address (same on all EVM chains).
+    address public constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     // -------------------------------------------------------------------------
     // State
@@ -229,6 +255,16 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         uint256 amount,
         uint32  destDomain,
         bytes32 mintRecipient
+    );
+
+    /// @notice Emitted when a bridge fee is collected from a user.
+    /// @param user   The user who paid the fee.
+    /// @param fee    USDC fee amount retained by the contract.
+    /// @param amount USDC amount burned via CCTP (after fee deduction).
+    event BridgeFeeCollected(
+        address indexed user,
+        uint256 fee,
+        uint256 amount
     );
 
     // -------------------------------------------------------------------------
@@ -627,8 +663,19 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
 
     /// @notice Relay a CCTP message, then split the minted USDC across multiple vaults.
     /// @dev Used when a single bridge burn aggregates capital destined for multiple vaults
-    ///      on this chain. The relayer calls this instead of relayAndDeposit when dest_vaults
-    ///      contains more than one entry.
+    ///      on this chain. The relayer calls this instead of `relayAndDeposit` when
+    ///      `dest_vaults` contains more than one entry.
+    ///      Uses the same balance-delta pattern as `relayAndDeposit` to compute the minted
+    ///      amount, then verifies the minted USDC covers the sum of `amounts` before
+    ///      depositing into each vault on behalf of `user`. Reverts if the relay fails,
+    ///      arrays are mismatched/empty, the minted amount is insufficient, or any vault
+    ///      is not whitelisted.
+    /// @param message     Raw CCTP V2 message bytes emitted from the source-chain burn event.
+    /// @param attestation Circle attestation signature authorising the relay.
+    /// @param user        The user who will receive vault shares or aTokens.
+    /// @param vaults      Whitelisted destination vaults (may include `aavePool`).
+    /// @param amounts     USDC amounts to deposit into each vault, aligned 1:1 with `vaults`.
+    ///                    Sum must be ≤ the USDC minted by the relay. Each entry must be > 0.
     function relayAndBatchDeposit(
         bytes calldata message,
         bytes calldata attestation,
@@ -719,6 +766,90 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
 
         // Pull total USDC from msg.sender in one transfer
         usdc.safeTransferFrom(msg.sender, address(this), total);
+
+        // Deposit into each local vault
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (vaults[i] == aavePool) {
+                usdc.forceApprove(aavePool, amounts[i]);
+                IPool(aavePool).supply(address(usdc), amounts[i], msg.sender, 0);
+                emit Deposited(msg.sender, vaults[i], amounts[i], amounts[i]);
+            } else {
+                usdc.forceApprove(vaults[i], amounts[i]);
+                uint256 sharesReceived = IERC4626(vaults[i]).deposit(amounts[i], msg.sender);
+                emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
+            }
+        }
+
+        // Execute CCTP burns for cross-chain deposits
+        for (uint256 i = 0; i < burns.length; i++) {
+            usdc.forceApprove(burns[i].tokenMessenger, burns[i].amount);
+
+            (bool success, ) = burns[i].tokenMessenger.call(
+                abi.encodeWithSelector(
+                    ITokenMessengerV2.depositForBurn.selector,
+                    burns[i].amount,
+                    burns[i].destDomain,
+                    burns[i].mintRecipient,
+                    address(usdc),
+                    burns[i].destinationCaller,
+                    burns[i].maxFee,
+                    burns[i].minFinalityThreshold
+                )
+            );
+            if (!success) revert CctpBurnFailed();
+
+            emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
+        }
+
+        emit StrategyCreated(msg.sender, total);
+    }
+
+    /// @notice Batch deposit into whitelisted vaults using a Permit2 signature for USDC.
+    /// @dev Identical to `selfBatchDeposit()` but pulls USDC via Permit2 SignatureTransfer
+    ///      instead of a direct ERC20 `transferFrom`. The user must have approved USDC to
+    ///      the canonical Permit2 contract once (`PERMIT2`); after that, every deposit is
+    ///      authorised purely by an off-chain signature, with no per-call ERC20 approval.
+    ///      `permit.permitted.token` must be USDC and `permit.permitted.amount` must be
+    ///      ≥ `sum(amounts) + sum(burns[i].amount)`. Permit2 itself enforces nonce
+    ///      uniqueness, deadline expiry, and signature validity — this function does not
+    ///      re-validate them.
+    /// @param vaults    Ordered list of vault addresses on the source chain. Each must be
+    ///                  whitelisted. May be empty if all capital is bridged.
+    /// @param amounts   USDC amounts corresponding 1:1 with `vaults`. Each must be > 0.
+    /// @param burns     Array of CCTP burn parameters for cross-chain deposits.
+    ///                  May be empty for single-chain deposits.
+    /// @param permit    Permit2 `PermitTransferFrom` payload signed by msg.sender.
+    /// @param signature EIP-712 signature authorising the Permit2 transfer.
+    function selfBatchDepositPermit2(
+        address[] calldata vaults,
+        uint256[] calldata amounts,
+        BridgeBurn[] calldata burns,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external nonReentrant {
+        if (vaults.length != amounts.length) revert InvalidInput();
+        if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
+
+        // Validate all vaults and compute total USDC needed
+        uint256 total = 0;
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (amounts[i] == 0) revert ZeroAmount();
+            total += amounts[i];
+        }
+        for (uint256 i = 0; i < burns.length; i++) {
+            if (burns[i].amount == 0) revert ZeroAmount();
+            if (burns[i].tokenMessenger == address(0)) revert ZeroAddress();
+            total += burns[i].amount;
+        }
+
+        // Pull total USDC via Permit2
+        ISignatureTransfer(PERMIT2).permitTransferFrom(
+            permit,
+            ISignatureTransfer.SignatureTransferDetails({ to: address(this), requestedAmount: total }),
+            msg.sender,
+            signature
+        );
 
         // Deposit into each local vault
         for (uint256 i = 0; i < vaults.length; i++) {
@@ -877,6 +1008,133 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
                 usdc.safeTransfer(msg.sender, netUsdc);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // User-callable: Standalone CCTP Bridge (with 1 bp fee)
+    // -------------------------------------------------------------------------
+
+    /// @notice Bridge USDC cross-chain via CCTP V2 with a 1 bp (0.01%) fee.
+    /// @dev User-callable (no `onlyOwner`). Pulls `amount` USDC from msg.sender,
+    ///      retains 1 bp as a fee in the contract, and burns the remainder via
+    ///      CCTP `depositForBurn`. The fee accumulates in `heldFeeShares[usdc]`
+    ///      and is sweepable by the owner via `sweep()`.
+    ///      Setting `destinationCaller` to `bytes32(0)` allows anyone to relay
+    ///      the message on the destination chain.
+    /// @param amount              Total USDC to pull from the user (fee deducted from this).
+    /// @param destDomain          CCTP destination domain ID (e.g. 6 = Base, 15 = Monad).
+    /// @param mintRecipient       bytes32-padded address to receive minted USDC on dest chain.
+    /// @param destinationCaller   bytes32-padded address permitted to relay on dest chain.
+    ///                            Set to `bytes32(0)` to allow anyone.
+    /// @param tokenMessenger      CCTP V2 TokenMessenger contract address.
+    /// @param maxFee              Maximum fee the CCTP protocol may charge (0 for standard).
+    /// @param minFinalityThreshold 0 = fast finality, 2000 = standard finality.
+    function bridge(
+        uint256 amount,
+        uint32  destDomain,
+        bytes32 mintRecipient,
+        bytes32 destinationCaller,
+        address tokenMessenger,
+        uint256 maxFee,
+        uint32  minFinalityThreshold
+    ) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (tokenMessenger == address(0)) revert ZeroAddress();
+
+        // Pull USDC from user
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Retain 1 bp fee (0.01%)
+        uint256 fee = amount / 10_000;
+        uint256 bridgeAmount = amount - fee;
+        heldFeeShares[address(usdc)] += fee;
+
+        // Burn remainder via CCTP
+        usdc.forceApprove(tokenMessenger, bridgeAmount);
+
+        (bool success, ) = tokenMessenger.call(
+            abi.encodeWithSelector(
+                ITokenMessengerV2.depositForBurn.selector,
+                bridgeAmount,
+                destDomain,
+                mintRecipient,
+                address(usdc),
+                destinationCaller,
+                maxFee,
+                minFinalityThreshold
+            )
+        );
+        if (!success) revert CctpBurnFailed();
+
+        emit BridgeFeeCollected(msg.sender, fee, bridgeAmount);
+        emit BridgeBurnInitiated(msg.sender, bridgeAmount, destDomain, mintRecipient);
+    }
+
+    /// @notice Bridge USDC cross-chain using a Permit2 signature instead of a direct approval.
+    /// @dev Identical to `bridge()` but pulls USDC via Permit2 SignatureTransfer.
+    ///      The user must have approved USDC to the canonical Permit2 contract once
+    ///      (`PERMIT2`); after that, every bridge call is authorised purely by an off-chain
+    ///      signature. `permit.permitted.token` must be USDC and `permit.permitted.amount`
+    ///      must be ≥ `amount`. Permit2 itself enforces nonce uniqueness, deadline expiry,
+    ///      and signature validity — this function does not re-validate them.
+    ///      Like `bridge()`, retains 1 bp (0.01%) of `amount` as a fee tracked under
+    ///      `heldFeeShares[usdc]` and burns the remainder via CCTP.
+    /// @param amount               Total USDC to pull from the user (fee deducted from this).
+    /// @param destDomain           CCTP destination domain ID (e.g. 6 = Base, 15 = Monad).
+    /// @param mintRecipient        bytes32-padded address to receive minted USDC on dest chain.
+    /// @param destinationCaller    bytes32-padded address permitted to relay on dest chain.
+    ///                             Set to `bytes32(0)` to allow anyone.
+    /// @param tokenMessenger       CCTP V2 TokenMessenger contract address.
+    /// @param maxFee               Maximum fee the CCTP protocol may charge (0 for standard).
+    /// @param minFinalityThreshold 0 = fast finality, 2000 = standard finality.
+    /// @param permit               Permit2 `PermitTransferFrom` payload signed by msg.sender.
+    /// @param signature            EIP-712 signature authorising the Permit2 transfer.
+    function bridgePermit2(
+        uint256 amount,
+        uint32  destDomain,
+        bytes32 mintRecipient,
+        bytes32 destinationCaller,
+        address tokenMessenger,
+        uint256 maxFee,
+        uint32  minFinalityThreshold,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (tokenMessenger == address(0)) revert ZeroAddress();
+
+        // Pull USDC via Permit2
+        ISignatureTransfer(PERMIT2).permitTransferFrom(
+            permit,
+            ISignatureTransfer.SignatureTransferDetails({ to: address(this), requestedAmount: amount }),
+            msg.sender,
+            signature
+        );
+
+        // Retain 1 bp fee (0.01%)
+        uint256 fee = amount / 10_000;
+        uint256 bridgeAmount = amount - fee;
+        heldFeeShares[address(usdc)] += fee;
+
+        // Burn remainder via CCTP
+        usdc.forceApprove(tokenMessenger, bridgeAmount);
+
+        (bool success, ) = tokenMessenger.call(
+            abi.encodeWithSelector(
+                ITokenMessengerV2.depositForBurn.selector,
+                bridgeAmount,
+                destDomain,
+                mintRecipient,
+                address(usdc),
+                destinationCaller,
+                maxFee,
+                minFinalityThreshold
+            )
+        );
+        if (!success) revert CctpBurnFailed();
+
+        emit BridgeFeeCollected(msg.sender, fee, bridgeAmount);
+        emit BridgeBurnInitiated(msg.sender, bridgeAmount, destDomain, mintRecipient);
     }
 
     // -------------------------------------------------------------------------
