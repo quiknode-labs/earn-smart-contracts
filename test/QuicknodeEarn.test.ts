@@ -3,12 +3,12 @@ import { expect } from "chai";
 import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 import { getAddress, parseUnits, encodeFunctionData } from "viem";
 
-describe("YieldRebalancer", function () {
+describe("QuicknodeEarn", function () {
   const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
   /**
-   * Deploy YieldRebalancer behind an ERC1967 proxy (UUPS pattern).
-   * Returns a contract handle to the proxy using the YieldRebalancer ABI.
+   * Deploy QuicknodeEarn behind an ERC1967 proxy (UUPS pattern).
+   * Returns a contract handle to the proxy using the QuicknodeEarn ABI.
    */
   async function deployBehindProxy(
     usdcAddr: `0x${string}`,
@@ -19,7 +19,7 @@ describe("YieldRebalancer", function () {
     initialVaults: `0x${string}`[],
   ) {
     // 1. Deploy implementation (immutables set in constructor)
-    const impl = await hre.viem.deployContract("YieldRebalancer", [
+    const impl = await hre.viem.deployContract("QuicknodeEarn", [
       usdcAddr,
       aavePool,
       aUsdc,
@@ -39,8 +39,8 @@ describe("YieldRebalancer", function () {
       initData,
     ]);
 
-    // 4. Return a contract handle to the proxy using the YieldRebalancer ABI
-    return await hre.viem.getContractAt("YieldRebalancer", proxy.address);
+    // 4. Return a contract handle to the proxy using the QuicknodeEarn ABI
+    return await hre.viem.getContractAt("QuicknodeEarn", proxy.address);
   }
 
   async function deployFixture() {
@@ -66,7 +66,7 @@ describe("YieldRebalancer", function () {
       "vB",
     ]);
 
-    // Deploy YieldRebalancer behind proxy
+    // Deploy QuicknodeEarn behind proxy
     // Use owner address as placeholder for aavePool/aUsdc (not exercised in non-Aave tests)
     // address(0) for messageTransmitter — CCTP not exercised in these tests
     const rebalancer = await deployBehindProxy(
@@ -131,7 +131,7 @@ describe("YieldRebalancer", function () {
 
     it("should revert on zero USDC address", async function () {
       await expect(
-        hre.viem.deployContract("YieldRebalancer", [
+        hre.viem.deployContract("QuicknodeEarn", [
           ZERO_ADDRESS,
           ZERO_ADDRESS,
           ZERO_ADDRESS,
@@ -263,7 +263,7 @@ describe("YieldRebalancer", function () {
     it("non-owner cannot add vault", async function () {
       const { rebalancer, vaultA, other } = await loadFixture(deployFixture);
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );
@@ -276,7 +276,7 @@ describe("YieldRebalancer", function () {
       const { rebalancer, vaultA, other } = await loadFixture(deployFixture);
       await rebalancer.write.addVault([vaultA.address]);
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );
@@ -286,110 +286,57 @@ describe("YieldRebalancer", function () {
     });
   });
 
-  // --- Deposit ---
+  // --- Role Management ---
 
-  describe("Deposit", function () {
-    it("should deposit USDC into vault on behalf of user", async function () {
-      const { rebalancer, usdc, vaultA, user } =
-        await loadFixture(deployFixture);
-
-      await rebalancer.write.addVault([vaultA.address]);
-      const depositAmount = parseUnits("1000", 6);
-
-      const usdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        usdc.address,
-        { client: { wallet: user } }
+  describe("Role Management", function () {
+    it("owner can set executor", async function () {
+      const { rebalancer, other } = await loadFixture(deployFixture);
+      await rebalancer.write.setExecutor([other.account.address]);
+      expect(getAddress(await rebalancer.read.executor())).to.equal(
+        getAddress(other.account.address)
       );
-      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-
-      await rebalancer.write.deposit([
-        user.account.address,
-        vaultA.address,
-        depositAmount,
-      ]);
-
-      // Shares should be in user's wallet
-      const userShares = await vaultA.read.balanceOf([user.account.address]);
-      expect(userShares > 0n).to.be.true;
-
-      // Rebalancer should hold zero shares
-      const rebalancerShares = await vaultA.read.balanceOf([rebalancer.address]);
-      expect(rebalancerShares).to.equal(0n);
-
-      // USDC should be in the vault
-      const vaultBalance = await usdc.read.balanceOf([vaultA.address]);
-      expect(vaultBalance).to.equal(depositAmount);
     });
 
-    it("should revert on non-whitelisted vault", async function () {
-      const { rebalancer, usdc, vaultA, user } =
-        await loadFixture(deployFixture);
-      const depositAmount = parseUnits("1000", 6);
-
-      const usdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        usdc.address,
-        { client: { wallet: user } }
+    it("owner can set relayer", async function () {
+      const { rebalancer, other } = await loadFixture(deployFixture);
+      await rebalancer.write.setRelayer([other.account.address]);
+      expect(getAddress(await rebalancer.read.relayer())).to.equal(
+        getAddress(other.account.address)
       );
-      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-
-      await expect(
-        rebalancer.write.deposit([
-          user.account.address,
-          vaultA.address,
-          depositAmount,
-        ])
-      ).to.be.rejectedWith("VaultNotApproved");
     });
 
-    it("should revert on zero amount", async function () {
-      const { rebalancer, vaultA, user } = await loadFixture(deployFixture);
-      await rebalancer.write.addVault([vaultA.address]);
-
-      await expect(
-        rebalancer.write.deposit([user.account.address, vaultA.address, 0n])
-      ).to.be.rejectedWith("ZeroAmount");
-    });
-
-    it("should revert on zero user address", async function () {
-      const { rebalancer, vaultA } = await loadFixture(deployFixture);
-      await rebalancer.write.addVault([vaultA.address]);
-
-      await expect(
-        rebalancer.write.deposit([
-          ZERO_ADDRESS,
-          vaultA.address,
-          parseUnits("100", 6),
-        ])
-      ).to.be.rejectedWith("ZeroAddress");
-    });
-
-    it("non-owner cannot call deposit", async function () {
-      const { rebalancer, usdc, vaultA, user, other } =
-        await loadFixture(deployFixture);
-      await rebalancer.write.addVault([vaultA.address]);
-      const depositAmount = parseUnits("1000", 6);
-
-      const usdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        usdc.address,
-        { client: { wallet: user } }
-      );
-      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-
+    it("non-owner cannot set executor", async function () {
+      const { rebalancer, other } = await loadFixture(deployFixture);
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );
       await expect(
-        rebalancerAsOther.write.deposit([
-          user.account.address,
-          vaultA.address,
-          depositAmount,
-        ])
+        rebalancerAsOther.write.setExecutor([other.account.address])
       ).to.be.rejectedWith("OwnableUnauthorizedAccount");
+    });
+
+    it("non-owner cannot set relayer", async function () {
+      const { rebalancer, other } = await loadFixture(deployFixture);
+      const rebalancerAsOther = await hre.viem.getContractAt(
+        "QuicknodeEarn",
+        rebalancer.address,
+        { client: { wallet: other } }
+      );
+      await expect(
+        rebalancerAsOther.write.setRelayer([other.account.address])
+      ).to.be.rejectedWith("OwnableUnauthorizedAccount");
+    });
+
+    it("executor and relayer default to zero address", async function () {
+      const { rebalancer } = await loadFixture(deployFixture);
+      expect(getAddress(await rebalancer.read.executor())).to.equal(
+        getAddress(ZERO_ADDRESS)
+      );
+      expect(getAddress(await rebalancer.read.relayer())).to.equal(
+        getAddress(ZERO_ADDRESS)
+      );
     });
   });
 
@@ -398,10 +345,13 @@ describe("YieldRebalancer", function () {
   describe("Rebalance", function () {
     async function depositedFixture() {
       const base = await deployFixture();
-      const { rebalancer, usdc, vaultA, vaultB, user } = base;
+      const { rebalancer, usdc, vaultA, vaultB, user, owner } = base;
 
       await rebalancer.write.addVault([vaultA.address]);
       await rebalancer.write.addVault([vaultB.address]);
+
+      // Set the owner as executor so it can call rebalance
+      await rebalancer.write.setExecutor([owner.account.address]);
 
       const depositAmount = parseUnits("1000", 6);
       const usdcAsUser = await hre.viem.getContractAt(
@@ -411,10 +361,16 @@ describe("YieldRebalancer", function () {
       );
       await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
 
-      await rebalancer.write.deposit([
-        user.account.address,
-        vaultA.address,
-        depositAmount,
+      // Use selfBatchDeposit (user-callable) to set up position
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "QuicknodeEarn",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await rebalancerAsUser.write.selfBatchDeposit([
+        [vaultA.address],
+        [depositAmount],
+        [],
       ]);
 
       // User approves rebalancer to spend vaultA shares
@@ -581,12 +537,12 @@ describe("YieldRebalancer", function () {
       ).to.be.rejectedWith("ArrayLengthMismatch");
     });
 
-    it("non-owner cannot call rebalance", async function () {
+    it("non-executor cannot call rebalance", async function () {
       const { rebalancer, vaultA, vaultB, user, other, userShares } =
         await loadFixture(depositedFixture);
 
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );
@@ -599,7 +555,7 @@ describe("YieldRebalancer", function () {
           [],
           [],
         ])
-      ).to.be.rejectedWith("OwnableUnauthorizedAccount");
+      ).to.be.rejectedWith("0x83906042"); // UnauthorizedExecutor()
     });
   });
 
@@ -624,7 +580,7 @@ describe("YieldRebalancer", function () {
       await usdcAsUser.write.approve([rebalancer.address, amountA + amountB]);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -658,7 +614,7 @@ describe("YieldRebalancer", function () {
       await usdcAsUser.write.approve([rebalancer.address, amount]);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -676,7 +632,7 @@ describe("YieldRebalancer", function () {
       await rebalancer.write.addVault([vaultA.address]);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -693,7 +649,7 @@ describe("YieldRebalancer", function () {
       const { rebalancer, user } = await loadFixture(deployFixture);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -707,7 +663,7 @@ describe("YieldRebalancer", function () {
       await rebalancer.write.addVault([vaultA.address]);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -742,7 +698,7 @@ describe("YieldRebalancer", function () {
       await usdcAsUser.write.approve([rebalancer.address, amountA + amountB]);
 
       const rebalancerAsUser = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: user } }
       );
@@ -782,6 +738,7 @@ describe("YieldRebalancer", function () {
         [vaultA.address, vaultB.address],
         [sharesA, sharesB],
         [0n, 0n],  // no fees
+        [],        // no burns
       ]);
 
       // User should get USDC back
@@ -805,6 +762,7 @@ describe("YieldRebalancer", function () {
         [vaultA.address, vaultB.address],
         [sharesA, sharesB],
         [feeA, 0n],
+        [],  // no burns
       ]);
 
       // Rebalancer should hold feeA shares of vaultA
@@ -830,6 +788,7 @@ describe("YieldRebalancer", function () {
         [vaultA.address, vaultB.address],
         [0n, 0n],   // 0 = full balance
         [0n, 0n],
+        [],  // no burns
       ]);
 
       const usdcAfter = await usdc.read.balanceOf([user.account.address]);
@@ -847,6 +806,7 @@ describe("YieldRebalancer", function () {
           [vaultA.address],
           [sharesA],
           [0n],
+          [],  // no burns
         ])
       ).to.be.rejectedWith("VaultNotApproved");
     });
@@ -860,6 +820,7 @@ describe("YieldRebalancer", function () {
           [vaultA.address],
           [sharesA],
           [0n, 0n],  // mismatched
+          [],  // no burns
         ])
       ).to.be.rejectedWith("ArrayLengthMismatch");
     });
@@ -873,6 +834,7 @@ describe("YieldRebalancer", function () {
           [vaultA.address],
           [sharesA],
           [sharesA],  // fee == shares, should revert
+          [],  // no burns
         ])
       ).to.be.rejectedWith("InvalidInput");
     });
@@ -881,7 +843,7 @@ describe("YieldRebalancer", function () {
       const { rebalancerAsUser } = await loadFixture(depositedMultiFixture);
 
       await expect(
-        rebalancerAsUser.write.selfBatchWithdraw([[], [], []])
+        rebalancerAsUser.write.selfBatchWithdraw([[], [], [], []])
       ).to.be.rejectedWith("InvalidInput");
     });
   });
@@ -891,10 +853,13 @@ describe("YieldRebalancer", function () {
   describe("Sweep", function () {
     async function feeAccruedFixture() {
       const base = await deployFixture();
-      const { rebalancer, usdc, vaultA, vaultB, user } = base;
+      const { rebalancer, usdc, vaultA, vaultB, user, owner } = base;
 
       await rebalancer.write.addVault([vaultA.address]);
       await rebalancer.write.addVault([vaultB.address]);
+
+      // Set the owner as executor so it can call rebalance
+      await rebalancer.write.setExecutor([owner.account.address]);
 
       const depositAmount = parseUnits("1000", 6);
       const usdcAsUser = await hre.viem.getContractAt(
@@ -904,10 +869,16 @@ describe("YieldRebalancer", function () {
       );
       await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
 
-      await rebalancer.write.deposit([
-        user.account.address,
-        vaultA.address,
-        depositAmount,
+      // Use selfBatchDeposit (user-callable) to set up position
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "QuicknodeEarn",
+        rebalancer.address,
+        { client: { wallet: user } }
+      );
+      await rebalancerAsUser.write.selfBatchDeposit([
+        [vaultA.address],
+        [depositAmount],
+        [],
       ]);
 
       // User approves rebalancer for vault shares (extra for fee)
@@ -919,7 +890,7 @@ describe("YieldRebalancer", function () {
       const userShares = await vaultA.read.balanceOf([user.account.address]);
       await vaultAAsUser.write.approve([rebalancer.address, userShares]);
 
-      // Rebalance with fee to accrue fee shares in the contract
+      // Rebalance with fee to accrue fee shares in the contract (owner is executor)
       const feeShares = userShares / 100n; // 1%
       await rebalancer.write.rebalance([
         user.account.address,
@@ -959,7 +930,7 @@ describe("YieldRebalancer", function () {
         await loadFixture(feeAccruedFixture);
 
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );
@@ -1029,7 +1000,7 @@ describe("YieldRebalancer", function () {
 
       // Step 2: new owner accepts
       const rebalancerAsOther = await hre.viem.getContractAt(
-        "YieldRebalancer",
+        "QuicknodeEarn",
         rebalancer.address,
         { client: { wallet: other } }
       );

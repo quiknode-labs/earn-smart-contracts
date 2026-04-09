@@ -7,7 +7,12 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 ## Overview
 
 - **Non-custodial:** Users grant ERC20 approvals to the contract but never transfer principal in. All vault shares and aTokens are held by the user's wallet.
-- **Owner privileges:** A trusted rebalancer EOA (the contract owner) calls privileged functions to deposit, rebalance, and bridge on the user's behalf. The owner cannot withdraw funds to an arbitrary address — all paths route back to the user or an approved vault.
+- **Three-role access control:** Privileged functions are split across three roles:
+  - **Owner** (multisig): vault whitelist management, fee sweeps, role assignment, UUPS upgrades
+  - **Executor**: rebalancing and cross-chain withdraw+bridge operations (`onlyExecutor`)
+  - **Relayer**: CCTP relay+deposit operations (`onlyRelayer`)
+
+  No role can withdraw funds to an arbitrary address — all paths route back to the user or an approved vault.
 - **User-callable functions:** Users can create strategies via `selfBatchDeposit` and close them via `selfBatchWithdraw` without owner involvement, providing a trustless exit path independent of the rebalancer service.
 - **Fee model:** Performance fees are collected as vault shares (not USDC). The executor computes 15% of yield, converts to shares, and passes them as `feeVaults[]`/`feeAmounts[]`. The contract transfers those shares from the user to itself, tracked in `heldFeeShares`. The owner sweeps via `sweep(token, amount)`.
 
@@ -17,13 +22,13 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 
 **Users retain custody at all times.** The flow is:
 
-1. User approves `YieldRebalancer` to spend their USDC (and vault shares/aTokens for withdrawals).
-2. The owner (rebalancer service) calls `deposit()` — USDC is pulled from the user and deposited into the chosen vault. Vault shares/aTokens are minted directly to the user.
-3. For rebalancing, the owner calls `rebalance()` — shares are pulled from the user, redeemed for USDC, and re-deposited into the new vault on behalf of the user.
+1. User approves `QuicknodeEarn` to spend their USDC (and vault shares/aTokens for withdrawals).
+2. Users create positions via `selfBatchDeposit()` — USDC is pulled from the user and deposited into chosen vaults. Vault shares/aTokens are minted directly to the user.
+3. For rebalancing, the executor calls `rebalance()` — shares are pulled from the user, redeemed for USDC, and re-deposited into the new vault on behalf of the user.
 4. Users can exit independently via `selfBatchWithdraw()` — no owner approval needed.
 5. At no point does the contract accumulate user positions — all shares/aTokens land in the user's wallet.
 
-The `onlyOwner` modifier on privileged functions prevents unauthorised third parties from triggering rebalances. The owner cannot withdraw funds to an arbitrary address — all deposit/rebalance/withdraw functions route funds back to the user or to an approved vault.
+Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment, upgrades), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). No role can withdraw funds to an arbitrary address — all functions route funds back to the user or to an approved vault.
 
 ---
 
@@ -47,15 +52,14 @@ The contract detects the Aave path by comparing the vault address to the immutab
 
 Circle's Cross-Chain Transfer Protocol (CCTP V2) is integrated for moving USDC between chains.
 
-### Owner-callable (rebalancer-initiated)
+### Executor/Relayer-callable
 
-- **`withdrawAndBridge()`** — Atomically withdraws from a vault, collects performance fees as vault shares, and burns USDC via `ITokenMessengerV2.depositForBurn`. USDC exists in the contract for only a single transaction.
-- **`relayAndDeposit()`** — Relays a CCTP attestation (minting USDC to this contract) and immediately deposits into a single vault. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
-- **`relayAndBatchDeposit()`** — Same as `relayAndDeposit` but splits the minted USDC across multiple vaults. Used when a single burn aggregates capital for multiple destination vaults.
+- **`withdrawAndBridge()`** (executor) — Atomically withdraws from a vault, collects performance fees as vault shares, and burns USDC via `ITokenMessengerV2.depositForBurn`. USDC exists in the contract for only a single transaction.
+- **`relayAndDeposit(message, attestation, user, vaults[], amounts[])`** (relayer) — Relays a CCTP attestation (minting USDC to this contract) and immediately deposits into the specified vaults. The balance-delta pattern measures the minted amount rather than trusting the relay return value.
 
 ### User-callable (self-service burns)
 
-- **`selfBatchDeposit(vaults[], amounts[], burns[])`** — Deposits USDC into local vaults AND optionally burns USDC via CCTP for cross-chain deposits, all in one transaction. Each `BridgeBurn` entry specifies a destination domain, recipient, and amount. The relayer picks up burns and calls `relayAndDeposit`/`relayAndBatchDeposit` on the destination chain.
+- **`selfBatchDeposit(vaults[], amounts[], burns[])`** — Deposits USDC into local vaults AND optionally burns USDC via CCTP for cross-chain deposits, all in one transaction. Each `BridgeBurn` entry specifies a destination domain, recipient, and amount. The relayer picks up burns and calls `relayAndDeposit` on the destination chain.
 - **`selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])`** — Closes vault positions AND optionally burns redeemed USDC via CCTP to bridge back to the user's source chain. When `burns` is non-empty, redeemed USDC is accumulated in the contract and burned. Pass `type(uint256).max` as `burns[i].amount` to burn all redeemed USDC after fees (recommended for close flows). Any remainder after burns is transferred to `msg.sender`. For withdrawal burns, `destinationCaller` is typically `bytes32(0)` (permissionless relay), allowing Circle's auto-relay service to handle the relay within ~1 minute at no gas cost.
 
 ### Finality thresholds
@@ -74,26 +78,39 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 
 ## Function Reference
 
-### Owner-only
+### Owner-only (`onlyOwner`)
 
 | Function | Description |
 | --- | --- |
-| `deposit(user, vault, usdcAmount)` | Pull USDC from user, deposit into vault |
-| `rebalance(user, fromVault, toVault, shares, feeVaults[], feeAmounts[])` | Move position between vaults with optional performance fee collection |
-| `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], tokenMessenger, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
-| `relayAndDeposit(message, attestation, user, vault)` | Atomic CCTP relay + single vault deposit |
-| `relayAndBatchDeposit(message, attestation, user, vaults[], amounts[])` | Atomic CCTP relay + multi-vault deposit |
 | `addVault(vault)` | Add vault to whitelist |
 | `batchAddVaults(vaults[])` | Add multiple vaults to whitelist |
 | `removeVault(vault)` | Remove vault from whitelist |
 | `sweep(token, amount)` | Sweep accumulated fee shares (or any ERC20) to owner |
+| `setExecutor(executor)` | Assign or change the executor address |
+| `setRelayer(relayer)` | Assign or change the relayer address |
 
-### User-callable
+### Executor-only (`onlyExecutor`)
+
+| Function | Description |
+| --- | --- |
+| `rebalance(user, fromVault, toVault, shares, feeVaults[], feeAmounts[])` | Move position between vaults with optional performance fee collection |
+| `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], tokenMessenger, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
+
+### Relayer-only (`onlyRelayer`)
+
+| Function | Description |
+| --- | --- |
+| `relayAndDeposit(message, attestation, user, vaults[], amounts[])` | Atomic CCTP relay + multi-vault deposit |
+
+### User-callable (no restriction)
 
 | Function | Description |
 | --- | --- |
 | `selfBatchDeposit(vaults[], amounts[], burns[])` | Deposit USDC into local vaults + optionally burn via CCTP for cross-chain deposits |
+| `selfBatchDepositPermit2(vaults[], amounts[], burns[], permit, signature)` | Same as `selfBatchDeposit` but pulls USDC via Permit2 instead of a separate approval |
 | `selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])` | Close vault positions with per-vault fee deduction + optionally burn via CCTP to bridge back to source chain |
+| `bridge(burns[])` | Burn USDC via CCTP for cross-chain transfer (no vault interaction) |
+| `bridgePermit2(burns[], permit, signature)` | Same as `bridge` but pulls USDC via Permit2 |
 
 ### View
 
@@ -103,6 +120,8 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | `aavePool()` | Aave V3 Pool address (immutable, `address(0)` if not on chain) |
 | `aUsdc()` | Aave aUSDC token address (immutable, `address(0)` if not on chain) |
 | `messageTransmitter()` | CCTP V2 MessageTransmitter address (immutable) |
+| `executor()` | Current executor address |
+| `relayer()` | Current relayer address |
 | `approvedVaults(vault)` | Whether a vault is whitelisted |
 | `vaultList(index)` | Vault address by index |
 | `heldFeeShares(token)` | Accumulated fee shares for a given token |
@@ -146,7 +165,7 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 | --- | --- |
 | `VaultAdded(vault)` | `addVault`, `batchAddVaults`, constructor |
 | `VaultRemoved(vault)` | `removeVault` |
-| `Deposited(user, vault, usdcAmount, sharesReceived)` | `deposit`, `selfBatchDeposit` |
+| `Deposited(user, vault, usdcAmount, sharesReceived)` | `selfBatchDeposit`, `selfBatchDepositPermit2` |
 | `Rebalanced(user, fromVault, toVault, shares, usdcAmount)` | `rebalance` |
 | `StrategyCreated(user, totalUsdc)` | `selfBatchDeposit` |
 | `StrategyExited(user, vault, shares, usdcReceived)` | `selfBatchWithdraw` |
@@ -154,7 +173,7 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 | `FeeSwept(token, recipient, amount)` | `sweep` |
 | `BridgeInitiated(user, vault, shares, usdcBurned, destDomain)` | `withdrawAndBridge` |
 | `BridgeBurnInitiated(user, amount, destDomain, mintRecipient)` | `selfBatchDeposit`, `selfBatchWithdraw` (CCTP burns) |
-| `DepositedFromBridge(user, vault, usdcAmount, sharesReceived)` | `relayAndDeposit`, `relayAndBatchDeposit` |
+| `DepositedFromBridge(user, vault, usdcAmount, sharesReceived)` | `relayAndDeposit` |
 
 ---
 
@@ -162,7 +181,7 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 
 | Mechanism | Purpose |
 | --- | --- |
-| `Ownable2Step` | Two-step ownership transfer prevents accidental transfer to wrong address |
+| `Ownable2Step` + role separation | Two-step ownership transfer; executor and relayer roles assigned by owner via `setExecutor`/`setRelayer` |
 | `ReentrancyGuard` | All state-changing functions are protected against re-entrant calls |
 | `SafeERC20` | Handles non-standard ERC20 tokens (no-return, reverting on failure) |
 | Vault whitelist | Only pre-approved vault addresses can receive deposits; fee vaults must also be whitelisted |
@@ -204,7 +223,7 @@ function initialize(address _owner, address[] calldata _initialVaults)
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `_owner` | Yes | Initial owner (rebalancer EOA). Reverts on `address(0)`. |
+| `_owner` | Yes | Initial owner (multisig). Reverts on `address(0)`. |
 | `_initialVaults` | No | Optional vault whitelist seeded at deploy time. Duplicates and zero addresses are silently skipped. |
 
 ---
@@ -263,12 +282,11 @@ npm install
 npm test
 ```
 
-The Hardhat test suite (`test/YieldRebalancer.test.ts`) uses a local Hardhat network with mock contracts (`MockERC20`, `MockERC4626`) and covers:
+The Hardhat test suite (`test/QuicknodeEarn.test.ts`) uses a local Hardhat network with mock contracts (`MockERC20`, `MockERC4626`) and covers:
 
 - **Deployment** — constructor args, immutable state, revert on zero USDC/owner, initial vault seeding, duplicate/zero-address skipping
 - **Vault Management** — addVault, batchAddVaults, removeVault, idempotent add, events, non-owner revert
-- **Deposit** — single-vault deposit, shares in user wallet, revert on non-whitelisted vault / zero amount / zero user / non-owner
-- **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on `fromVault == toVault` / non-approved vaults / zero shares / zero user / mismatched fee arrays / non-owner
+- **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on `fromVault == toVault` / non-approved vaults / zero shares / zero user / mismatched fee arrays / non-executor
 - **selfBatchDeposit** — multi-vault deposit in one tx, revert on non-whitelisted / mismatched arrays / empty arrays / zero amount
 - **selfBatchWithdraw** — multi-vault withdrawal (no fees), withdrawal with fee deduction, `shares[i] == 0` full-balance mode, revert on non-whitelisted / mismatched arrays / `fee >= shares` / empty arrays
 - **Sweep** — owner sweeps fee shares, partial sweep bookkeeping, revert on zero amount / non-owner
@@ -294,11 +312,11 @@ The proxy address is deterministic via CreateX CREATE3 (salt version 11) and nev
 
 ### Scope
 
-The primary audit target is `contracts/YieldRebalancer.sol` (~780 lines). The mock contracts (`contracts/mocks/`) and deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
+The primary audit target is `contracts/QuicknodeEarn.sol` (~780 lines). The mock contracts (`contracts/mocks/`) and deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
 
 ### Trust Model Assumptions
 
-1. **Owner is a trusted, operationally secure EOA or multisig.** The owner can call any privileged function on behalf of any user who has granted approval. A compromised owner cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares.
+1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, assigns roles, and upgrades the implementation. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults.
 2. **Whitelisted vaults are legitimate ERC4626 contracts or the genuine Aave V3 Pool.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
 3. **Circle's CCTP contracts are trusted.** The `relayAndDeposit` and `withdrawAndBridge` functions interact with Circle-deployed contracts without additional validation.
 4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour beyond what Aave's aUSDC provides.
@@ -316,7 +334,7 @@ The primary audit target is `contracts/YieldRebalancer.sol` (~780 lines). The mo
 
 ```
 contracts/
-  YieldRebalancer.sol           Main contract (~780 lines)
+  QuicknodeEarn.sol           Main contract (~780 lines)
   interfaces/
     ICreateX.sol                CreateX factory interface for deterministic deployment
   mocks/
@@ -325,7 +343,7 @@ contracts/
 script/
   Deploy.s.sol                  Forge deployment script (CreateX CREATE3)
 test/
-  YieldRebalancer.test.ts       Hardhat + viem integration tests (~1000 lines)
+  QuicknodeEarn.test.ts       Hardhat + viem integration tests (~1000 lines)
 foundry.toml                    Forge config (solc 0.8.28, optimizer, via-ir)
 hardhat.config.cts              Hardhat config (.cts for ESM compatibility)
 ```

@@ -69,22 +69,23 @@ struct BridgeBurn {
     uint32  minFinalityThreshold; // 0 = fast finality (seconds), 2000 = standard finality (full chain finality)
 }
 
-/// @title YieldRebalancer
+/// @title QuicknodeEarn
 /// @notice Non-custodial yield-optimiser that moves user funds between whitelisted
 ///         Morpho (ERC4626) vaults and the Aave V3 Pool to maximise supply APY.
 /// @dev Architecture overview:
 ///      - Users retain full custody: they grant ERC20 approvals to this contract but
 ///        never transfer principal in; all vault shares/aTokens are held by the user.
-///      - The owner (a trusted rebalancer EOA/service) calls the privileged functions
-///        (`deposit`, `rebalance`, `withdrawAndBridge`, `relayAndDeposit`)
-///        to move capital on the user's behalf.
+///      - Three privileged roles:
+///        - **Owner** (multisig): vault whitelist, fee sweeps, role assignment, upgrades.
+///        - **Executor**: calls `rebalance` and `withdrawAndBridge` to move capital.
+///        - **Relayer**: calls `relayAndDeposit` to relay CCTP messages and deposit.
 ///      - Users can create strategies via `selfBatchDeposit` and close them via
 ///        `selfBatchWithdraw` without owner involvement.
 ///      - Fee model: a performance fee is collected as vault shares (not USDC). The executor
 ///        computes 15% of yield earned across ALL strategy vaults, converts each to vault
 ///        shares, and passes them as `feeVaults[]`/`feeAmounts[]` on rebalance/withdraw
-///        calls. The contract transfers those shares from the user to itself, accumulating
-///        them in `heldFeeShares`. The owner sweeps accumulated shares via `sweep()`.
+///        calls. The contract transfers those shares from the user to itself. The owner
+///        sweeps accumulated fee tokens via `sweep()`.
 ///        Fee arrays may be empty (no-fee rebalance) or contain vaults unrelated to the
 ///        current `fromVault`/`toVault` pair — the executor collects from ALL vaults with
 ///        accrued yield in a single operation.
@@ -92,12 +93,19 @@ struct BridgeBurn {
 ///        prevents the owner from draining users into arbitrary contracts.
 ///      - Two-step ownership (`Ownable2Step`) prevents accidental ownership transfer to
 ///        an uncontrolled address.
-///      - CCTP integration: `withdrawAndBridge` burns USDC cross-chain via Circle's
-///        CCTP V2; `relayAndDeposit` relays a CCTP message and atomically deposits.
+///      - CCTP V2 integration: `withdrawAndBridge` burns USDC cross-chain after a
+///        vault withdrawal; `relayAndDeposit` relays a CCTP message and atomically
+///        deposits on the destination chain; `selfBatchDeposit` and `selfBatchWithdraw`
+///        accept optional `BridgeBurn[]` arrays for cross-chain deposits and bridge-back
+///        on close; `bridge` / `bridgePermit2` provide standalone CCTP bridging with a
+///        1 bp (0.01%) fee.
+///      - Permit2 integration: `selfBatchDepositPermit2` and `bridgePermit2` pull USDC
+///        via Uniswap's canonical Permit2 contract, replacing per-call ERC20 approvals
+///        with off-chain EIP-712 signatures.
 ///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
 ///        with no owner requirement, providing a trustless exit path independent of
 ///        the rebalancer.
-contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
+contract QuicknodeEarn is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     /// @notice Canonical Permit2 deployment address (same on all EVM chains).
@@ -131,15 +139,28 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     ///         Maintained in sync with `approvedVaults`.
     address[] public vaultList;
 
-    /// @notice Accumulated vault shares taken as performance fees, keyed by vault address.
-    ///         Incremented each time the executor passes non-empty `feeVaults`/`feeAmounts`
-    ///         to `rebalance`, `selfBatchWithdraw`, or `withdrawAndBridge`.
-    ///         The owner drains a specific vault's accumulated shares via `sweep(token, amount)`.
-    mapping(address => uint256) public heldFeeShares;
+
+    /// @notice The executor address permitted to call `rebalance` and `withdrawAndBridge`.
+    ///         Set by the owner via `setExecutor()`. May be an EOA or a contract.
+    address public executor;
+
+    /// @notice The relayer address permitted to call `relayAndDeposit`.
+    ///         Set by the owner via `setRelayer()`. May be an EOA or a contract.
+    address public relayer;
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
+
+    /// @notice Emitted when the executor address is updated.
+    /// @param oldExecutor The previous executor address.
+    /// @param newExecutor The new executor address.
+    event ExecutorUpdated(address indexed oldExecutor, address indexed newExecutor);
+
+    /// @notice Emitted when the relayer address is updated.
+    /// @param oldRelayer The previous relayer address.
+    /// @param newRelayer The new relayer address.
+    event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
 
     /// @notice Emitted when a vault is added to the whitelist.
     /// @param vault The address of the newly approved vault.
@@ -186,7 +207,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     /// @notice Emitted for each vault leg of a `selfBatchWithdraw` call.
     /// @param user        The user whose position was closed.
     /// @param vault       The vault that was withdrawn from.
-    /// @param shares      Shares (or aUSDC) redeemed.
+    /// @param shares      Net shares (or aUSDC) redeemed after fee deduction.
     /// @param usdcReceived USDC returned to the user.
     event StrategyExited(
         address indexed user,
@@ -271,6 +292,12 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     // Errors
     // -------------------------------------------------------------------------
 
+    /// @notice Thrown when a non-executor address calls an executor-only function.
+    error UnauthorizedExecutor();
+
+    /// @notice Thrown when a non-relayer address calls a relayer-only function.
+    error UnauthorizedRelayer();
+
     /// @notice Thrown when an operation targets a vault that is not in the whitelist.
     /// @param vault The non-approved vault address.
     error VaultNotApproved(address vault);
@@ -294,10 +321,26 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     error MessageRelayFailed();
 
     // -------------------------------------------------------------------------
+    // Modifiers
+    // -------------------------------------------------------------------------
+
+    /// @dev Restricts a function to the designated executor address.
+    modifier onlyExecutor() {
+        if (msg.sender != executor) revert UnauthorizedExecutor();
+        _;
+    }
+
+    /// @dev Restricts a function to the designated relayer address.
+    modifier onlyRelayer() {
+        if (msg.sender != relayer) revert UnauthorizedRelayer();
+        _;
+    }
+
+    // -------------------------------------------------------------------------
     // Constructor (implementation only — sets immutables, disables initializers)
     // -------------------------------------------------------------------------
 
-    /// @notice Deploy the YieldRebalancer implementation.
+    /// @notice Deploy the QuicknodeEarn implementation.
     /// @dev Sets immutable addresses baked into bytecode. Storage-based state (owner,
     ///      vault whitelist) is set via `initialize()` through the proxy.
     ///      `_disableInitializers()` prevents the implementation from being initialized
@@ -407,41 +450,23 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     }
 
     // -------------------------------------------------------------------------
-    // Owner-only: Deposits
+    // Owner-only: Role management
     // -------------------------------------------------------------------------
 
-    /// @notice Deposit USDC from `user` into a single whitelisted vault.
-    /// @dev Two deposit paths:
-    ///      - **Aave** (`vault == aavePool`): USDC is supplied to `IPool.supply`, which
-    ///        mints aUSDC 1:1 directly to `user`. The contract never holds aUSDC.
-    ///      - **Morpho / ERC4626**: USDC is deposited via `IERC4626.deposit`, which
-    ///        mints vault shares to `user`. The contract never holds shares.
-    ///      The reason Aave does not go through ERC4626 is that the Aave V3 Pool is not
-    ///      itself an ERC4626 vault — it exposes a separate `supply` / `withdraw` API and
-    ///      returns rebasing aTokens rather than fixed-ratio shares.
-    /// @param user       The user on whose behalf USDC is deposited; receives shares/aTokens.
-    /// @param vault      Whitelisted vault address or `aavePool`.
-    /// @param usdcAmount Amount of USDC to pull from `user` and deposit (6 decimals).
-    function deposit(
-        address user,
-        address vault,
-        uint256 usdcAmount
-    ) external onlyOwner nonReentrant {
-        if (user == address(0)) revert ZeroAddress();
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
-        if (usdcAmount == 0) revert ZeroAmount();
+    /// @notice Set the executor address permitted to call `rebalance` and `withdrawAndBridge`.
+    /// @param _executor The new executor address. Use `address(0)` to revoke.
+    function setExecutor(address _executor) external onlyOwner {
+        address old = executor;
+        executor = _executor;
+        emit ExecutorUpdated(old, _executor);
+    }
 
-        usdc.safeTransferFrom(user, address(this), usdcAmount);
-
-        if (vault == aavePool) {
-            usdc.forceApprove(aavePool, usdcAmount);
-            IPool(aavePool).supply(address(usdc), usdcAmount, user, 0);
-            emit Deposited(user, vault, usdcAmount, usdcAmount); // aTokens ~1:1
-        } else {
-            usdc.forceApprove(vault, usdcAmount);
-            uint256 sharesReceived = IERC4626(vault).deposit(usdcAmount, user);
-            emit Deposited(user, vault, usdcAmount, sharesReceived);
-        }
+    /// @notice Set the relayer address permitted to call `relayAndDeposit`.
+    /// @param _relayer The new relayer address. Use `address(0)` to revoke.
+    function setRelayer(address _relayer) external onlyOwner {
+        address old = relayer;
+        relayer = _relayer;
+        emit RelayerUpdated(old, _relayer);
     }
 
     // -------------------------------------------------------------------------
@@ -465,13 +490,12 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         for (uint256 i = 0; i < feeVaults.length; i++) {
             if (!approvedVaults[feeVaults[i]]) revert VaultNotApproved(feeVaults[i]);
             IERC20(feeVaults[i]).safeTransferFrom(user, address(this), feeAmounts[i]);
-            heldFeeShares[feeVaults[i]] += feeAmounts[i];
         }
         emit PerformanceFeeCollected(user, feeVaults, feeAmounts);
     }
 
     // -------------------------------------------------------------------------
-    // Owner-only: Rebalancing
+    // Executor-only: Rebalancing
     // -------------------------------------------------------------------------
 
     /// @notice Atomically move a user's position from one vault to another.
@@ -497,7 +521,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         uint256 shares,
         address[] calldata feeVaults,
         uint256[] calldata feeAmounts
-    ) external onlyOwner nonReentrant {
+    ) external onlyExecutor nonReentrant {
         if (user == address(0)) revert ZeroAddress();
         if (!approvedVaults[fromVault]) revert VaultNotApproved(fromVault);
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
@@ -530,7 +554,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     }
 
     // -------------------------------------------------------------------------
-    // Owner-only: Atomic withdraw + CCTP burn
+    // Executor-only: Atomic withdraw + CCTP burn
     // -------------------------------------------------------------------------
 
     /// @notice Atomically withdraw from a vault and burn USDC cross-chain via CCTP V2.
@@ -569,7 +593,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         bytes32 destinationCaller,
         uint256 maxFee,
         uint32  minFinalityThreshold
-    ) external onlyOwner nonReentrant returns (uint256 netUsdc) {
+    ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
         if (user == address(0)) revert ZeroAddress();
         if (!approvedVaults[vault]) revert VaultNotApproved(vault);
         if (shares == 0) revert ZeroAmount();
@@ -608,81 +632,36 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     }
 
     // -------------------------------------------------------------------------
-    // Owner-only: Atomic relay + deposit (single transaction)
+    // Relayer-only: Atomic relay + deposit (single transaction)
     // -------------------------------------------------------------------------
 
-    /// @notice Atomically relay a CCTP V2 message and deposit the minted USDC into a vault.
+    /// @notice Atomically relay a CCTP V2 message and deposit the minted USDC into one
+    ///         or more whitelisted vaults on behalf of `user`.
     /// @dev Flow:
     ///      1. Snapshot USDC balance of this contract before the relay.
     ///      2. Call `IMessageTransmitter.receiveMessage` — Circle's contract mints USDC
     ///         directly to this contract's address.
-    ///      3. Compute minted amount from the balance delta (avoids trusting the relay return value).
-    ///      4. Deposit the full minted amount into `vault` on behalf of `user`.
-    ///      The balance-delta pattern is used rather than reading the relay return value because
-    ///      CCTP's `receiveMessage` returns a bool, not the minted amount, and off-by-one USDC
-    ///      from accumulated fees would otherwise be deposited.
-    ///      Setting `destinationCaller = address(this)` (as bytes32) at burn time on the source
-    ///      chain means only this contract can relay — this is the recommended MEV-protection
-    ///      pattern for atomic relay+deposit, eliminating the need for a second rebalancer tx.
-    /// @param message     Raw CCTP V2 message bytes emitted from the source-chain burn event.
-    /// @param attestation Circle attestation signature authorising the relay.
-    /// @param user        The user who will receive vault shares or aTokens.
-    /// @param vault       Whitelisted destination vault or `aavePool`.
-    function relayAndDeposit(
-        bytes calldata message,
-        bytes calldata attestation,
-        address user,
-        address vault
-    ) external onlyOwner nonReentrant {
-        if (user == address(0)) revert ZeroAddress();
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
-        if (messageTransmitter == address(0)) revert ZeroAddress();
-
-        // Step 1: Snapshot USDC balance before relay
-        uint256 before = usdc.balanceOf(address(this));
-
-        // Step 2: Relay the CCTP message — USDC minted to this contract
-        bool success = IMessageTransmitter(messageTransmitter).receiveMessage(message, attestation);
-        if (!success) revert MessageRelayFailed();
-
-        // Step 3: Compute minted amount from balance delta
-        uint256 amount = usdc.balanceOf(address(this)) - before;
-        if (amount == 0) revert ZeroAmount();
-
-        // Step 4: Deposit minted USDC into vault on behalf of user
-        if (vault == aavePool) {
-            usdc.forceApprove(aavePool, amount);
-            IPool(aavePool).supply(address(usdc), amount, user, 0);
-            emit DepositedFromBridge(user, vault, amount, amount);
-        } else {
-            usdc.forceApprove(vault, amount);
-            uint256 sharesReceived = IERC4626(vault).deposit(amount, user);
-            emit DepositedFromBridge(user, vault, amount, sharesReceived);
-        }
-    }
-
-    /// @notice Relay a CCTP message, then split the minted USDC across multiple vaults.
-    /// @dev Used when a single bridge burn aggregates capital destined for multiple vaults
-    ///      on this chain. The relayer calls this instead of `relayAndDeposit` when
-    ///      `dest_vaults` contains more than one entry.
-    ///      Uses the same balance-delta pattern as `relayAndDeposit` to compute the minted
-    ///      amount, then verifies the minted USDC covers the sum of `amounts` before
-    ///      depositing into each vault on behalf of `user`. Reverts if the relay fails,
-    ///      arrays are mismatched/empty, the minted amount is insufficient, or any vault
-    ///      is not whitelisted.
+    ///      3. Compute minted amount from the balance delta (avoids trusting the relay
+    ///         return value — `receiveMessage` returns a bool, not the minted amount).
+    ///      4. Verify the minted amount covers the sum of `amounts`.
+    ///      5. Deposit into each vault on behalf of `user`.
+    ///      Setting `destinationCaller = address(this)` (as bytes32) at burn time on the
+    ///      source chain means only this contract can relay — this is the recommended
+    ///      MEV-protection pattern for atomic relay+deposit.
+    ///      Works for both single-vault (1-element arrays) and multi-vault relay+deposit.
     /// @param message     Raw CCTP V2 message bytes emitted from the source-chain burn event.
     /// @param attestation Circle attestation signature authorising the relay.
     /// @param user        The user who will receive vault shares or aTokens.
     /// @param vaults      Whitelisted destination vaults (may include `aavePool`).
     /// @param amounts     USDC amounts to deposit into each vault, aligned 1:1 with `vaults`.
     ///                    Sum must be ≤ the USDC minted by the relay. Each entry must be > 0.
-    function relayAndBatchDeposit(
+    function relayAndDeposit(
         bytes calldata message,
         bytes calldata attestation,
         address user,
         address[] calldata vaults,
         uint256[] calldata amounts
-    ) external onlyOwner nonReentrant {
+    ) external onlyRelayer nonReentrant {
         if (user == address(0)) revert ZeroAddress();
         if (vaults.length != amounts.length) revert InvalidInput();
         if (vaults.length == 0) revert InvalidInput();
@@ -900,7 +879,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     ///      `feeAmounts[i]` must be < `shares[i]`. Pass 0 for vaults with no fee.
     ///      Vaults where the effective amount resolves to zero are silently skipped.
     ///      Aave path: `shares[i]` is treated as aUSDC amount. Fee shares for Aave are
-    ///      tracked under the `aUsdc` token address in `heldFeeShares` (not `aavePool`).
+    ///      retained under the `aUsdc` token address (not `aavePool`).
     ///      When `burns` is non-empty, redeemed USDC is accumulated in the contract and
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
@@ -940,7 +919,6 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
                 uint256 feeAmt = feeAmounts[i];
                 if (feeAmt > 0) {
                     if (feeAmt >= amt) revert InvalidInput();
-                    heldFeeShares[aUsdc] += feeAmt;
                     amt -= feeAmt;
                     feeVaultsEmitted[feeCount] = aUsdc;
                     feeAmountsEmitted[feeCount] = feeAmt;
@@ -955,7 +933,6 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
                 uint256 feeAmt = feeAmounts[i];
                 if (feeAmt > 0) {
                     if (feeAmt >= amt) revert InvalidInput();
-                    heldFeeShares[vault] += feeAmt;
                     amt -= feeAmt;
                     feeVaultsEmitted[feeCount] = vault;
                     feeAmountsEmitted[feeCount] = feeAmt;
@@ -1017,8 +994,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     /// @notice Bridge USDC cross-chain via CCTP V2 with a 1 bp (0.01%) fee.
     /// @dev User-callable (no `onlyOwner`). Pulls `amount` USDC from msg.sender,
     ///      retains 1 bp as a fee in the contract, and burns the remainder via
-    ///      CCTP `depositForBurn`. The fee accumulates in `heldFeeShares[usdc]`
-    ///      and is sweepable by the owner via `sweep()`.
+    ///      CCTP `depositForBurn`. The fee is sweepable by the owner via `sweep()`.
     ///      Setting `destinationCaller` to `bytes32(0)` allows anyone to relay
     ///      the message on the destination chain.
     /// @param amount              Total USDC to pull from the user (fee deducted from this).
@@ -1047,7 +1023,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         // Retain 1 bp fee (0.01%)
         uint256 fee = amount / 10_000;
         uint256 bridgeAmount = amount - fee;
-        heldFeeShares[address(usdc)] += fee;
+
 
         // Burn remainder via CCTP
         usdc.forceApprove(tokenMessenger, bridgeAmount);
@@ -1077,8 +1053,8 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     ///      signature. `permit.permitted.token` must be USDC and `permit.permitted.amount`
     ///      must be ≥ `amount`. Permit2 itself enforces nonce uniqueness, deadline expiry,
     ///      and signature validity — this function does not re-validate them.
-    ///      Like `bridge()`, retains 1 bp (0.01%) of `amount` as a fee tracked under
-    ///      `heldFeeShares[usdc]` and burns the remainder via CCTP.
+    ///      Like `bridge()`, retains 1 bp (0.01%) of `amount` as a fee and burns the
+    ///      remainder via CCTP.
     /// @param amount               Total USDC to pull from the user (fee deducted from this).
     /// @param destDomain           CCTP destination domain ID (e.g. 6 = Base, 15 = Monad).
     /// @param mintRecipient        bytes32-padded address to receive minted USDC on dest chain.
@@ -1114,7 +1090,7 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
         // Retain 1 bp fee (0.01%)
         uint256 fee = amount / 10_000;
         uint256 bridgeAmount = amount - fee;
-        heldFeeShares[address(usdc)] += fee;
+
 
         // Burn remainder via CCTP
         usdc.forceApprove(tokenMessenger, bridgeAmount);
@@ -1142,15 +1118,12 @@ contract YieldRebalancer is Initializable, Ownable2Step, ReentrancyGuard, UUPSUp
     // -------------------------------------------------------------------------
 
     /// @notice Sweep a specific amount of an ERC20 token to the owner.
-    /// @dev Use this to drain accumulated vault share fees tracked in `heldFeeShares`,
-    ///      or to recover accidentally sent tokens. Decrements `heldFeeShares` bookkeeping
-    ///      by up to `amount` (capped at the tracked balance to avoid underflow).
+    /// @dev Use this to drain accumulated fee tokens (vault shares, aUSDC, or USDC
+    ///      bridge fees), or to recover accidentally sent tokens.
     /// @param token  The ERC20 token to sweep.
     /// @param amount The amount to transfer to the owner.
     function sweep(address token, uint256 amount) external onlyOwner {
         if (amount == 0) revert ZeroAmount();
-        uint256 held = heldFeeShares[token];
-        heldFeeShares[token] = held > amount ? held - amount : 0;
         IERC20(token).safeTransfer(owner(), amount);
         emit FeeSwept(token, owner(), amount);
     }
