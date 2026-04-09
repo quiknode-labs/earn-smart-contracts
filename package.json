@@ -1,7 +1,7 @@
 {
   "name": "earn-smart-contracts",
   "version": "1.0.0",
-  "description": "YieldRebalancer smart contracts — non-custodial yield optimiser for Morpho and Aave V3",
+  "description": "QuicknodeEarn smart contracts — non-custodial yield optimiser for Morpho and Aave V3",
   "type": "commonjs",
   "scripts": {
     "test": "hardhat test",

@@ -1,6 +1,6 @@
 # Deployment Guide
 
-Step-by-step instructions to deploy Yield Rebalancer from scratch.
+Step-by-step instructions to deploy Quicknode Earn from scratch.
 
 ---
 
@@ -17,11 +17,11 @@ Step-by-step instructions to deploy Yield Rebalancer from scratch.
 
 ## 1. Smart Contract (UUPS Proxy)
 
-The YieldRebalancer is deployed behind a **UUPS proxy**. The proxy has a permanent deterministic address via CreateX CREATE3. Upgrades deploy a new implementation contract and call `upgradeToAndCall` on the proxy -- no address changes needed.
+The QuicknodeEarn is deployed behind a **UUPS proxy**. The proxy has a permanent deterministic address via CreateX CREATE3. Upgrades deploy a new implementation contract and call `upgradeToAndCall` on the proxy -- no address changes needed.
 
 **Architecture:**
 - **Proxy** (ERC1967Proxy): deterministic address via CreateX CREATE3, never changes
-- **Implementation** (YieldRebalancer): deployed via regular CREATE, can be upgraded
+- **Implementation** (QuicknodeEarn): deployed via regular CREATE, can be upgraded
 - **Immutables** (`usdc`, `aavePool`, `aUsdc`, `messageTransmitter`): baked into each implementation's bytecode
 - **Storage** (owner, vault whitelist, fee shares): lives in the proxy, persists across upgrades
 
@@ -72,8 +72,8 @@ forge script script/Deploy.s.sol \
 **After first deploy only:**
 
 1. Copy the `Proxy:` address from the script output
-2. Update `YIELD_REBALANCER_ADDRESS` and `NEXT_PUBLIC_YIELD_REBALANCER_ADDRESS` in `.env`
-3. Update `NEXT_PUBLIC_YIELD_REBALANCER_ADDRESS` in Vercel env vars
+2. Update `QUICKNODE_EARN_ADDRESS` and `NEXT_PUBLIC_QUICKNODE_EARN_ADDRESS` in `.env`
+3. Update `NEXT_PUBLIC_QUICKNODE_EARN_ADDRESS` in Vercel env vars
 4. Verify the implementation contract (see below)
 5. Run `scripts/add-vaults.ts` if there are new vaults beyond what was seeded from the old contract
 
@@ -117,7 +117,7 @@ After each deployment or upgrade, verify the **implementation** contract on the 
 
 ```bash
 source .env && cd smart-contracts
-forge verify-contract <implementation_address> contracts/YieldRebalancer.sol:YieldRebalancer \
+forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:QuicknodeEarn \
   --chain-id 8453 \
   --constructor-args $(cast abi-encode "constructor(address,address,address,address)" \
     0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
@@ -132,7 +132,7 @@ forge verify-contract <implementation_address> contracts/YieldRebalancer.sol:Yie
 
 ```bash
 source .env && cd smart-contracts
-forge verify-contract <implementation_address> contracts/YieldRebalancer.sol:YieldRebalancer \
+forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:QuicknodeEarn \
   --constructor-args $(cast abi-encode "constructor(address,address,address,address)" \
     0x754704Bc059F8C67012fEd69BC8A327a5aafb603 \
     0x0000000000000000000000000000000000000000 \
@@ -151,7 +151,7 @@ forge verify-contract <implementation_address> contracts/YieldRebalancer.sol:Yie
 
 ### Add vaults
 
-Reads `YIELD_REBALANCER_ADDRESS` and `PRIVATE_KEY` from `.env`. Run from the repo root:
+Reads `QUICKNODE_EARN_ADDRESS` and `PRIVATE_KEY` from `.env`. Run from the repo root:
 
 ```bash
 source .env
@@ -207,7 +207,7 @@ PRIVATE_KEY=0x<bot_wallet_private_key>
 EXECUTION_MODE=live
 
 # Contract (proxy address -- permanent, same on all chains)
-YIELD_REBALANCER_ADDRESS=0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2
+QUICKNODE_EARN_ADDRESS=0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2
 
 # Supabase
 SUPABASE_URL=https://<project>.supabase.co
@@ -272,7 +272,7 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGc...
 SUPABASE_SERVICE_KEY=eyJhbGc...
 
 # Contract (proxy address -- permanent)
-NEXT_PUBLIC_YIELD_REBALANCER_ADDRESS=0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2
+NEXT_PUBLIC_QUICKNODE_EARN_ADDRESS=0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2
 
 # RPC (public endpoint is fine for reads)
 BASE_RPC_URL=https://mainnet.base.org
@@ -314,7 +314,7 @@ Set all `frontend/.env.local` variables in Vercel's environment settings. Deploy
 - [ ] Implementation verified on Monadscan (`forge verify-contract ... --verifier-url ...`)
 - [ ] Vault whitelist confirmed on-chain (`cast call <proxy> "getApprovedVaults()"`)
 - [ ] Any new vaults added (`scripts/add-vaults.ts`) if needed
-- [ ] `.env` updated with proxy address (`YIELD_REBALANCER_ADDRESS`, `NEXT_PUBLIC_YIELD_REBALANCER_ADDRESS`)
+- [ ] `.env` updated with proxy address (`QUICKNODE_EARN_ADDRESS`, `NEXT_PUBLIC_QUICKNODE_EARN_ADDRESS`)
 - [ ] Implementation addresses added as comments in `.env` for reference
 - [ ] Vercel env vars updated with proxy address
 - [ ] Supabase schema applied, Web3 auth enabled

@@ -14,7 +14,7 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 
   No role can withdraw funds to an arbitrary address — all paths route back to the user or an approved vault.
 - **User-callable functions:** Users can create strategies via `selfBatchDeposit` and close them via `selfBatchWithdraw` without owner involvement, providing a trustless exit path independent of the rebalancer service.
-- **Fee model:** Performance fees are collected as vault shares (not USDC). The executor computes 15% of yield, converts to shares, and passes them as `feeVaults[]`/`feeAmounts[]`. The contract transfers those shares from the user to itself, tracked in `heldFeeShares`. The owner sweeps via `sweep(token, amount)`.
+- **Fee model:** Performance fees are collected as vault shares (not USDC). The executor computes 15% of yield, converts to shares, and passes them as `feeVaults[]`/`feeAmounts[]`. The contract transfers those shares from the user to itself. The owner sweeps accumulated fee tokens via `sweep(token, amount)`.
 
 ---
 
@@ -124,7 +124,6 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | `relayer()` | Current relayer address |
 | `approvedVaults(vault)` | Whether a vault is whitelisted |
 | `vaultList(index)` | Vault address by index |
-| `heldFeeShares(token)` | Accumulated fee shares for a given token |
 | `getApprovedVaults()` | Return full list of whitelisted vaults |
 | `isVaultApproved(vault)` | Check if a vault is whitelisted |
 
@@ -138,8 +137,7 @@ The contract uses a **vault-share performance fee** model, not a USDC basis-poin
 2. For each vault with accrued yield, the executor converts the fee to vault shares.
 3. The executor passes `feeVaults[]` and `feeAmounts[]` arrays to `rebalance`, `selfBatchWithdraw`, or `withdrawAndBridge`.
 4. The contract transfers those shares from the user to itself via `safeTransferFrom`.
-5. Shares accumulate in `heldFeeShares[vault]` (for Morpho) or `heldFeeShares[aUsdc]` (for Aave).
-6. The owner sweeps accumulated shares via `sweep(token, amount)`, which transfers shares to the owner and decrements `heldFeeShares`.
+5. The owner sweeps accumulated fee tokens via `sweep(token, amount)`.
 
 Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the current `fromVault`/`toVault` pair — the executor collects from ALL vaults with accrued yield in a single call to amortise gas. Each fee vault must be whitelisted.
 
@@ -299,10 +297,15 @@ The Hardhat test suite (`test/QuicknodeEarn.test.ts`) uses a local Hardhat netwo
 
 **UUPS Proxy (permanent, same on all chains):** `0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`
 
-| Chain | Proxy | Implementation | Version | Deployed |
-| --- | --- | --- | --- | --- |
-| Base (8453) | [`0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`](https://basescan.org/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | `0x9B4a3541aCBbF210aa50610477F39a83B84d3adA` | v12 | 2026-04-02 |
-| Monad (143) | [`0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`](https://monadscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | `0x3B53652255aCeE7D0F7d5814dC6b784bD465d2fB` | v12 | 2026-04-02 |
+| Chain | Proxy | Implementation | Vaults |
+| --- | --- | --- | ---: |
+| Ethereum (1) | [`0xcc204B…d2`](https://etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xbD10E52f…4C`](https://etherscan.io/address/0xbD10E52f04bb4E2D6F70B5Dc87db2CCC81eE0B4C) | 54 |
+| Optimism (10) | [`0xcc204B…d2`](https://optimistic.etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x0f7fb50D…B2`](https://optimistic.etherscan.io/address/0x0f7fb50D01C8a368E50a24d333D213a9147f7dB2) | 4 |
+| Unichain (130) | [`0xcc204B…d2`](https://uniscan.xyz/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x99C29e98…49`](https://uniscan.xyz/address/0x99C29e98a02f6B6B55f03ea549626fE1CE7CBC49) | 1 |
+| Polygon (137) | [`0xcc204B…d2`](https://polygonscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xb19e8639…ee`](https://polygonscan.com/address/0xb19e8639FCCb63eA5Cfe4B424DCd5773bAc121ee) | 3 |
+| Monad (143) | [`0xcc204B…d2`](https://monadscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x6ca7881b…0A`](https://monadscan.com/address/0x6ca7881bdA26638ce494A1672a9D1d3A3B2BD50A) | 3 |
+| Base (8453) | [`0xcc204B…d2`](https://basescan.org/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x89844408…47`](https://basescan.org/address/0x8984440800f04DA84D270704f91211D806557047) | 43 |
+| Arbitrum (42161) | [`0xcc204B…d2`](https://arbiscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xb19e8639…ee`](https://arbiscan.io/address/0xb19e8639FCCb63eA5Cfe4B424DCd5773bAc121ee) | 12 |
 
 The proxy address is deterministic via CreateX CREATE3 (salt version 11) and never changes. Upgrades deploy a new implementation and call `upgradeToAndCall` on the proxy.
 
@@ -325,8 +328,7 @@ The primary audit target is `contracts/QuicknodeEarn.sol` (~780 lines). The mock
 
 1. `selfBatchWithdraw` with `shares[i] == 0` reads the user's full on-chain balance. If the user has multiple strategies in the same vault, this will over-withdraw. The off-chain rebalancer always passes explicit share amounts to avoid this.
 2. `withdrawAndBridge` uses a low-level call to the CCTP TokenMessenger to avoid proxy return-value decoding issues. The `CctpBurnFailed` error is thrown if the call reverts.
-3. Aave fee shares are keyed by `aUsdc` (not `aavePool`) in `heldFeeShares`, since the actual token transferred is aUSDC.
-4. `_collectFees` only supports ERC4626 (Morpho) vault shares. Aave fee collection is handled inline within `selfBatchWithdraw`.
+3. `_collectFees` only supports ERC4626 (Morpho) vault shares. Aave fee collection is handled inline within `selfBatchWithdraw`, where fee shares are keyed by `aUsdc` (not `aavePool`) since the actual token transferred is aUSDC.
 
 ---
 

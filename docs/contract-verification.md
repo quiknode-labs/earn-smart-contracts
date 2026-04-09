@@ -22,7 +22,7 @@ Set `ETHERSCAN_API_KEY` in your `.env` (one key works for all chains via V2).
 ## Step 1 — Flatten the contract
 
 ```bash
-forge flatten contracts/YieldRebalancer.sol > /tmp/YieldRebalancer_flat.sol
+forge flatten contracts/QuicknodeEarn.sol > /tmp/QuicknodeEarn_flat.sol
 ```
 
 ## Step 2 — Encode constructor args
@@ -81,9 +81,9 @@ curl -s -X POST "https://api.etherscan.io/v2/api?chainid=<CHAIN_ID>" \
   --data-urlencode "action=verifysourcecode" \
   --data-urlencode "apikey=$ETHERSCAN_API_KEY" \
   --data-urlencode "contractaddress=<CONTRACT_ADDRESS>" \
-  --data-urlencode "sourceCode=$(cat /tmp/YieldRebalancer_flat.sol)" \
+  --data-urlencode "sourceCode=$(cat /tmp/QuicknodeEarn_flat.sol)" \
   --data-urlencode "codeformat=solidity-single-file" \
-  --data-urlencode "contractname=YieldRebalancer" \
+  --data-urlencode "contractname=QuicknodeEarn" \
   --data-urlencode "compilerversion=v0.8.28+commit.7893614a" \
   --data-urlencode "optimizationUsed=1" \
   --data-urlencode "runs=200" \
@@ -122,7 +122,7 @@ Success:
 Find the exact version from the build artifact:
 
 ```bash
-cat out/YieldRebalancer.sol/YieldRebalancer.json \
+cat out/QuicknodeEarn.sol/QuicknodeEarn.json \
   | python3 -c "import json,sys; m=json.load(sys.stdin)['metadata']; print(m['compiler']['version'])"
 ```
 

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
-import "../contracts/YieldRebalancer.sol";
+import "../contracts/QuicknodeEarn.sol";
 import "../contracts/interfaces/ICreateX.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
@@ -11,14 +11,14 @@ interface IExistingRebalancer {
     function getApprovedVaults() external view returns (address[] memory);
 }
 
-/// @dev Production deployment script for YieldRebalancer behind a UUPS proxy.
+/// @dev Production deployment script for QuicknodeEarn behind a UUPS proxy.
 ///
 ///      First deploy (proxy does not exist yet):
 ///        forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "run(uint32)" 8453
 ///
 ///      Upgrade (proxy already deployed):
 ///        forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "upgrade(uint32)" 8453
-contract DeployYieldRebalancer is Script {
+contract DeployQuicknodeEarn is Script {
     // CreateX factory -same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
 
@@ -112,7 +112,7 @@ contract DeployYieldRebalancer is Script {
         vm.startBroadcast(deployerKey);
 
         // Step 1: Deploy implementation (regular CREATE — address doesn't matter)
-        YieldRebalancer impl = new YieldRebalancer(
+        QuicknodeEarn impl = new QuicknodeEarn(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -122,7 +122,7 @@ contract DeployYieldRebalancer is Script {
 
         // Step 2: Deploy ERC1967Proxy via CreateX CREATE3 (deterministic address)
         bytes memory initData = abi.encodeCall(
-            YieldRebalancer.initialize,
+            QuicknodeEarn.initialize,
             (deployer, initialVaults)
         );
 
@@ -137,7 +137,7 @@ contract DeployYieldRebalancer is Script {
 
         require(proxy != address(0), "Proxy deploy failed");
 
-        YieldRebalancer rebalancer = YieldRebalancer(proxy);
+        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
         console.log("Proxy:           ", proxy);
         console.log("Owner:           ", rebalancer.owner());
         console.log("Vaults on chain: ", rebalancer.getApprovedVaults().length);
@@ -172,7 +172,7 @@ contract DeployYieldRebalancer is Script {
         vm.startBroadcast(deployerKey);
 
         // Step 1: Deploy implementation (regular CREATE -address doesn't matter)
-        YieldRebalancer impl = new YieldRebalancer(
+        QuicknodeEarn impl = new QuicknodeEarn(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -183,7 +183,7 @@ contract DeployYieldRebalancer is Script {
         // Step 2: Deploy ERC1967Proxy via CreateX CREATE3 (deterministic address)
         //         The proxy constructor calls initialize() on the implementation via delegatecall.
         bytes memory initData = abi.encodeCall(
-            YieldRebalancer.initialize,
+            QuicknodeEarn.initialize,
             (deployer, initialVaults)
         );
 
@@ -199,7 +199,7 @@ contract DeployYieldRebalancer is Script {
         require(proxy != address(0), "Proxy deploy failed");
 
         // Verify through the proxy
-        YieldRebalancer rebalancer = YieldRebalancer(proxy);
+        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
         console.log("Proxy:      ", proxy);
         console.log("Owner:      ", rebalancer.owner());
         console.log("Vaults:     ", rebalancer.getApprovedVaults().length);
@@ -207,12 +207,15 @@ contract DeployYieldRebalancer is Script {
     }
 
     /// @notice Upgrade an existing proxy to a new implementation.
-    ///         Deploys a new implementation and calls upgradeToAndCall on the proxy.
+    ///         Deploys a new implementation, calls upgradeToAndCall on the proxy,
+    ///         and assigns executor + relayer roles from environment variables.
     function upgrade(uint32 chainId) external {
         ChainConfig memory cfg = getConfig(chainId);
 
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
+        address executorAddr = vm.envAddress("EXECUTOR_ADDRESS");
+        address relayerAddr  = vm.envAddress("RELAYER_ADDRESS");
 
         // Compute the proxy address (same salt as initial deploy)
         bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(uint96(11))));
@@ -228,7 +231,7 @@ contract DeployYieldRebalancer is Script {
         vm.startBroadcast(deployerKey);
 
         // Deploy new implementation
-        YieldRebalancer newImpl = new YieldRebalancer(
+        QuicknodeEarn newImpl = new QuicknodeEarn(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -237,22 +240,31 @@ contract DeployYieldRebalancer is Script {
         console.log("New impl:       ", address(newImpl));
 
         // Upgrade the proxy (no re-initialization needed)
-        YieldRebalancer(proxy).upgradeToAndCall(address(newImpl), "");
+        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        rebalancer.upgradeToAndCall(address(newImpl), "");
+
+        // Assign executor and relayer roles
+        rebalancer.setExecutor(executorAddr);
+        rebalancer.setRelayer(relayerAddr);
 
         vm.stopBroadcast();
 
         // Verify the upgrade
-        YieldRebalancer rebalancer = YieldRebalancer(proxy);
         console.log("Owner (kept):   ", rebalancer.owner());
+        console.log("Executor:       ", rebalancer.executor());
+        console.log("Relayer:        ", rebalancer.relayer());
         console.log("Vaults (kept):  ", rebalancer.getApprovedVaults().length);
         console.log("USDC:           ", address(rebalancer.usdc()));
     }
 
     /// @notice Upgrade a proxy at an explicit address (for when salt doesn't match).
+    ///         Also assigns executor + relayer roles from environment variables.
     function upgradeAt(uint32 chainId, address proxy) external {
         ChainConfig memory cfg = getConfig(chainId);
 
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address executorAddr = vm.envAddress("EXECUTOR_ADDRESS");
+        address relayerAddr  = vm.envAddress("RELAYER_ADDRESS");
 
         console.log("=== Upgrade At ===");
         console.log("Chain ID:       ", chainId);
@@ -262,7 +274,7 @@ contract DeployYieldRebalancer is Script {
 
         vm.startBroadcast(deployerKey);
 
-        YieldRebalancer newImpl = new YieldRebalancer(
+        QuicknodeEarn newImpl = new QuicknodeEarn(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -270,14 +282,19 @@ contract DeployYieldRebalancer is Script {
         );
         console.log("New impl:       ", address(newImpl));
 
-        YieldRebalancer(proxy).upgradeToAndCall(address(newImpl), "");
+        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        rebalancer.upgradeToAndCall(address(newImpl), "");
+
+        // Assign executor and relayer roles
+        rebalancer.setExecutor(executorAddr);
+        rebalancer.setRelayer(relayerAddr);
 
         vm.stopBroadcast();
 
-        YieldRebalancer rebalancer = YieldRebalancer(proxy);
         console.log("Owner (kept):   ", rebalancer.owner());
+        console.log("Executor:       ", rebalancer.executor());
+        console.log("Relayer:        ", rebalancer.relayer());
         console.log("Vaults (kept):  ", rebalancer.getApprovedVaults().length);
         console.log("USDC:           ", address(rebalancer.usdc()));
-        console.log("MsgTransmitter: ", rebalancer.messageTransmitter());
     }
 }
