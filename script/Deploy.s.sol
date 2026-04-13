@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
-import "../contracts/QuicknodeEarn.sol";
+import "../contracts/QuicknodeEarnProxy.sol";
 import "../contracts/interfaces/ICreateX.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
@@ -11,14 +11,14 @@ interface IExistingRebalancer {
     function getApprovedVaults() external view returns (address[] memory);
 }
 
-/// @dev Production deployment script for QuicknodeEarn behind a UUPS proxy.
+/// @dev Production deployment script for QuicknodeEarnProxy behind a UUPS proxy.
 ///
 ///      First deploy (proxy does not exist yet):
 ///        forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "run(uint32)" 8453
 ///
 ///      Upgrade (proxy already deployed):
 ///        forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --sig "upgrade(uint32)" 8453
-contract DeployQuicknodeEarn is Script {
+contract DeployQuicknodeEarnProxy is Script {
     // CreateX factory -same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
 
@@ -112,7 +112,7 @@ contract DeployQuicknodeEarn is Script {
         vm.startBroadcast(deployerKey);
 
         // Step 1: Deploy implementation (regular CREATE — address doesn't matter)
-        QuicknodeEarn impl = new QuicknodeEarn(
+        QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -122,7 +122,7 @@ contract DeployQuicknodeEarn is Script {
 
         // Step 2: Deploy ERC1967Proxy via CreateX CREATE3 (deterministic address)
         bytes memory initData = abi.encodeCall(
-            QuicknodeEarn.initialize,
+            QuicknodeEarnProxy.initialize,
             (deployer, initialVaults)
         );
 
@@ -137,7 +137,7 @@ contract DeployQuicknodeEarn is Script {
 
         require(proxy != address(0), "Proxy deploy failed");
 
-        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
         console.log("Proxy:           ", proxy);
         console.log("Owner:           ", rebalancer.owner());
         console.log("Vaults on chain: ", rebalancer.getApprovedVaults().length);
@@ -172,7 +172,7 @@ contract DeployQuicknodeEarn is Script {
         vm.startBroadcast(deployerKey);
 
         // Step 1: Deploy implementation (regular CREATE -address doesn't matter)
-        QuicknodeEarn impl = new QuicknodeEarn(
+        QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -183,7 +183,7 @@ contract DeployQuicknodeEarn is Script {
         // Step 2: Deploy ERC1967Proxy via CreateX CREATE3 (deterministic address)
         //         The proxy constructor calls initialize() on the implementation via delegatecall.
         bytes memory initData = abi.encodeCall(
-            QuicknodeEarn.initialize,
+            QuicknodeEarnProxy.initialize,
             (deployer, initialVaults)
         );
 
@@ -199,7 +199,7 @@ contract DeployQuicknodeEarn is Script {
         require(proxy != address(0), "Proxy deploy failed");
 
         // Verify through the proxy
-        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
         console.log("Proxy:      ", proxy);
         console.log("Owner:      ", rebalancer.owner());
         console.log("Vaults:     ", rebalancer.getApprovedVaults().length);
@@ -231,7 +231,7 @@ contract DeployQuicknodeEarn is Script {
         vm.startBroadcast(deployerKey);
 
         // Deploy new implementation
-        QuicknodeEarn newImpl = new QuicknodeEarn(
+        QuicknodeEarnProxy newImpl = new QuicknodeEarnProxy(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -240,7 +240,7 @@ contract DeployQuicknodeEarn is Script {
         console.log("New impl:       ", address(newImpl));
 
         // Upgrade the proxy (no re-initialization needed)
-        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
         rebalancer.upgradeToAndCall(address(newImpl), "");
 
         // Assign executor and relayer roles
@@ -274,7 +274,7 @@ contract DeployQuicknodeEarn is Script {
 
         vm.startBroadcast(deployerKey);
 
-        QuicknodeEarn newImpl = new QuicknodeEarn(
+        QuicknodeEarnProxy newImpl = new QuicknodeEarnProxy(
             cfg.usdc,
             cfg.aavePool,
             cfg.aUsdc,
@@ -282,7 +282,7 @@ contract DeployQuicknodeEarn is Script {
         );
         console.log("New impl:       ", address(newImpl));
 
-        QuicknodeEarn rebalancer = QuicknodeEarn(proxy);
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
         rebalancer.upgradeToAndCall(address(newImpl), "");
 
         // Assign executor and relayer roles
