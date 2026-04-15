@@ -8,7 +8,7 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 
 - **Non-custodial:** Users grant ERC20 approvals to the contract but never transfer principal in. All vault shares and aTokens are held by the user's wallet.
 - **Three-role access control:** Privileged functions are split across three roles:
-  - **Owner** (multisig): vault whitelist management, fee sweeps, role assignment, UUPS upgrades
+  - **Owner** (multisig): vault whitelist management, fee sweeps, role assignment
   - **Executor**: rebalancing and cross-chain withdraw+bridge operations (`onlyExecutor`)
   - **Relayer**: CCTP relay+deposit operations (`onlyRelayer`)
 
@@ -28,7 +28,7 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 4. Users can exit independently via `selfBatchWithdraw()` — no owner approval needed.
 5. At no point does the contract accumulate user positions — all shares/aTokens land in the user's wallet.
 
-Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment, upgrades), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). No role can withdraw funds to an arbitrary address — all functions route funds back to the user or to an approved vault.
+Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). No role can withdraw funds to an arbitrary address — all functions route funds back to the user or to an approved vault.
 
 ---
 
@@ -85,7 +85,7 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | `addVault(vault)` | Add vault to whitelist |
 | `batchAddVaults(vaults[])` | Add multiple vaults to whitelist |
 | `removeVault(vault)` | Remove vault from whitelist |
-| `sweep(token, amount)` | Sweep accumulated fee shares (or any ERC20) to owner |
+| `sweep(token, amount)` | Sweep accumulated fee shares or any ERC20 to owner |
 | `setExecutor(executor)` | Assign or change the executor address |
 | `setRelayer(relayer)` | Assign or change the relayer address |
 
@@ -107,10 +107,7 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | Function | Description |
 | --- | --- |
 | `selfBatchDeposit(vaults[], amounts[], burns[])` | Deposit USDC into local vaults + optionally burn via CCTP for cross-chain deposits |
-| `selfBatchDepositPermit2(vaults[], amounts[], burns[], permit, signature)` | Same as `selfBatchDeposit` but pulls USDC via Permit2 instead of a separate approval |
 | `selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])` | Close vault positions with per-vault fee deduction + optionally burn via CCTP to bridge back to source chain |
-| `bridge(burns[])` | Burn USDC via CCTP for cross-chain transfer (no vault interaction) |
-| `bridgePermit2(burns[], permit, signature)` | Same as `bridge` but pulls USDC via Permit2 |
 
 ### View
 
@@ -147,6 +144,8 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 
 | Error | Trigger |
 | --- | --- |
+| `UnauthorizedExecutor()` | Non-executor address calls an executor-only function |
+| `UnauthorizedRelayer()` | Non-relayer address calls a relayer-only function |
 | `VaultNotApproved(address vault)` | Operation targets a vault not in the whitelist |
 | `ZeroAmount()` | Zero-amount argument where a positive value is required |
 | `ZeroAddress()` | Zero address where a non-zero address is required |
@@ -161,9 +160,11 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 
 | Event | Emitted by |
 | --- | --- |
+| `ExecutorUpdated(oldExecutor, newExecutor)` | `setExecutor` |
+| `RelayerUpdated(oldRelayer, newRelayer)` | `setRelayer` |
 | `VaultAdded(vault)` | `addVault`, `batchAddVaults`, constructor |
 | `VaultRemoved(vault)` | `removeVault` |
-| `Deposited(user, vault, usdcAmount, sharesReceived)` | `selfBatchDeposit`, `selfBatchDepositPermit2` |
+| `Deposited(user, vault, usdcAmount, sharesReceived)` | `selfBatchDeposit` |
 | `Rebalanced(user, fromVault, toVault, shares, usdcAmount)` | `rebalance` |
 | `StrategyCreated(user, totalUsdc)` | `selfBatchDeposit` |
 | `StrategyExited(user, vault, shares, usdcReceived)` | `selfBatchWithdraw` |
@@ -191,19 +192,19 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 
 ---
 
-## Constructor & Initializer
+## Constructor
 
-The contract is deployed behind a **UUPS proxy**. The constructor sets immutables only; storage-based state is set via `initialize()` through the proxy.
-
-### Constructor (implementation)
+The contract is deployed directly (not behind a proxy). All immutables and initial state are set in the constructor.
 
 ```solidity
 constructor(
     address _usdc,
     address _aavePool,
     address _aUsdc,
-    address _messageTransmitter
-)
+    address _messageTransmitter,
+    address _owner,
+    address[] memory _initialVaults
+) Ownable(_owner)
 ```
 
 | Parameter | Required | Description |
@@ -212,15 +213,6 @@ constructor(
 | `_aavePool` | No | Aave V3 Pool address. `address(0)` on chains without Aave. |
 | `_aUsdc` | No | Aave aUSDC token address. `address(0)` on chains without Aave. |
 | `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
-
-### Initializer (called once through proxy)
-
-```solidity
-function initialize(address _owner, address[] calldata _initialVaults)
-```
-
-| Parameter | Required | Description |
-| --- | --- | --- |
 | `_owner` | Yes | Initial owner (multisig). Reverts on `address(0)`. |
 | `_initialVaults` | No | Optional vault whitelist seeded at deploy time. Duplicates and zero addresses are silently skipped. |
 
@@ -228,7 +220,7 @@ function initialize(address _owner, address[] calldata _initialVaults)
 
 ## Deployment
 
-See [`docs/deployment.md`](docs/deployment.md) for the full step-by-step guide.
+See [`docs/deployment.md`](docs/deployment.md) for the full step-by-step guide and [`docs/contract-verification.md`](docs/contract-verification.md) for source verification via the Etherscan V2 API.
 
 Quick summary:
 
@@ -244,7 +236,7 @@ forge build
 forge script script/Deploy.s.sol \
   --rpc-url "$BASE_RPC_URL" \
   --broadcast \
-  --sig "run(uint32)" 8453 \
+  --sig "runWithVaults(uint32,address[])" 8453 "[0x...]" \
   --private-key "$PRIVATE_KEY"
 ```
 
@@ -253,7 +245,7 @@ forge script script/Deploy.s.sol \
 - **Use `forge script`, not viem's `writeContract`** — viem's `eth_estimateGas` fails for large CreateX initCode. Forge bypasses gas estimation.
 - **Use the `Deployed:` log line, not `Predicted:`** — `computeCreate3Address` returns the wrong address. The `Deployed:` log from the Forge script is authoritative.
 - **Bump the salt version** — `uint96(N)` in `Deploy.s.sol` for each new deployment. Never reuse a version; once the CreateX proxy is deployed it persists.
-- **Verification:** Base uses Sourcify. Monad uses Etherscan V2 API (`--verifier-url "https://api.etherscan.io/v2/api?chainid=143"`).
+- **Verification:** Use the Etherscan V2 API for all chains (see [`docs/contract-verification.md`](docs/contract-verification.md)).
 
 After deploy, add vaults via the scripts in the main `earn` repo:
 
@@ -284,6 +276,7 @@ The Hardhat test suite (`test/QuicknodeEarn.test.ts`) uses a local Hardhat netwo
 
 - **Deployment** — constructor args, immutable state, revert on zero USDC/owner, initial vault seeding, duplicate/zero-address skipping
 - **Vault Management** — addVault, batchAddVaults, removeVault, idempotent add, events, non-owner revert
+- **Role Management** — setExecutor, setRelayer, non-owner revert, defaults to zero address
 - **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on `fromVault == toVault` / non-approved vaults / zero shares / zero user / mismatched fee arrays / non-executor
 - **selfBatchDeposit** — multi-vault deposit in one tx, revert on non-whitelisted / mismatched arrays / empty arrays / zero amount
 - **selfBatchWithdraw** — multi-vault withdrawal (no fees), withdrawal with fee deduction, `shares[i] == 0` full-balance mode, revert on non-whitelisted / mismatched arrays / `fee >= shares` / empty arrays
@@ -295,19 +288,19 @@ The Hardhat test suite (`test/QuicknodeEarn.test.ts`) uses a local Hardhat netwo
 
 ## Deployed Addresses
 
-**UUPS Proxy (permanent, same on all chains):** `0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`
+**Deterministic address (same on all chains):** `0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2`
 
-| Chain | Proxy | Implementation | Vaults |
-| --- | --- | --- | ---: |
-| Ethereum (1) | [`0xcc204B…d2`](https://etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xbD10E52f…4C`](https://etherscan.io/address/0xbD10E52f04bb4E2D6F70B5Dc87db2CCC81eE0B4C) | 54 |
-| Optimism (10) | [`0xcc204B…d2`](https://optimistic.etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x0f7fb50D…B2`](https://optimistic.etherscan.io/address/0x0f7fb50D01C8a368E50a24d333D213a9147f7dB2) | 4 |
-| Unichain (130) | [`0xcc204B…d2`](https://uniscan.xyz/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x99C29e98…49`](https://uniscan.xyz/address/0x99C29e98a02f6B6B55f03ea549626fE1CE7CBC49) | 1 |
-| Polygon (137) | [`0xcc204B…d2`](https://polygonscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xb19e8639…ee`](https://polygonscan.com/address/0xb19e8639FCCb63eA5Cfe4B424DCd5773bAc121ee) | 3 |
-| Monad (143) | [`0xcc204B…d2`](https://monadscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x6ca7881b…0A`](https://monadscan.com/address/0x6ca7881bdA26638ce494A1672a9D1d3A3B2BD50A) | 3 |
-| Base (8453) | [`0xcc204B…d2`](https://basescan.org/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0x89844408…47`](https://basescan.org/address/0x8984440800f04DA84D270704f91211D806557047) | 43 |
-| Arbitrum (42161) | [`0xcc204B…d2`](https://arbiscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | [`0xb19e8639…ee`](https://arbiscan.io/address/0xb19e8639FCCb63eA5Cfe4B424DCd5773bAc121ee) | 12 |
+| Chain | Address | Vaults |
+| --- | --- | ---: |
+| Ethereum (1) | [`0xcc204B…d2`](https://etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 54 |
+| Optimism (10) | [`0xcc204B…d2`](https://optimistic.etherscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 4 |
+| Unichain (130) | [`0xcc204B…d2`](https://uniscan.xyz/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 1 |
+| Polygon (137) | [`0xcc204B…d2`](https://polygonscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 3 |
+| Monad (143) | [`0xcc204B…d2`](https://monadscan.com/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 3 |
+| Base (8453) | [`0xcc204B…d2`](https://basescan.org/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 43 |
+| Arbitrum (42161) | [`0xcc204B…d2`](https://arbiscan.io/address/0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2) | 12 |
 
-The proxy address is deterministic via CreateX CREATE3 (salt version 11) and never changes. Upgrades deploy a new implementation and call `upgradeToAndCall` on the proxy.
+The address is deterministic via CreateX CREATE3 (salt version 11).
 
 ---
 
@@ -315,11 +308,11 @@ The proxy address is deterministic via CreateX CREATE3 (salt version 11) and nev
 
 ### Scope
 
-The primary audit target is `contracts/QuicknodeEarn.sol` (~780 lines). The mock contracts (`contracts/mocks/`) and deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
+The primary audit target is `contracts/QuicknodeEarn.sol` (~851 lines). Mock contracts (`contracts/mocks/`) and the deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
 
 ### Trust Model Assumptions
 
-1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, assigns roles, and upgrades the implementation. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults.
+1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, and assigns roles. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults.
 2. **Whitelisted vaults are legitimate ERC4626 contracts or the genuine Aave V3 Pool.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
 3. **Circle's CCTP contracts are trusted.** The `relayAndDeposit` and `withdrawAndBridge` functions interact with Circle-deployed contracts without additional validation.
 4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour beyond what Aave's aUSDC provides.
@@ -336,16 +329,20 @@ The primary audit target is `contracts/QuicknodeEarn.sol` (~780 lines). The mock
 
 ```
 contracts/
-  QuicknodeEarn.sol           Main contract (~780 lines)
+  QuicknodeEarn.sol             Main contract (~851 lines)
   interfaces/
     ICreateX.sol                CreateX factory interface for deterministic deployment
   mocks/
-    MockERC20.sol               Mock ERC20 for testing
+    ERC1967ProxyImport.sol      Re-export of OpenZeppelin ERC1967Proxy for Hardhat compilation
+    MockERC20.sol               Mock ERC20 (6 decimals) for testing
     MockERC4626.sol             Mock ERC4626 vault for testing
 script/
   Deploy.s.sol                  Forge deployment script (CreateX CREATE3)
 test/
-  QuicknodeEarn.test.ts       Hardhat + viem integration tests (~1000 lines)
-foundry.toml                    Forge config (solc 0.8.28, optimizer, via-ir)
+  QuicknodeEarn.test.ts         Hardhat + viem integration tests
+docs/
+  deployment.md                 Full deployment guide
+  contract-verification.md      Source verification via Etherscan V2 API
+foundry.toml                    Forge config (solc 0.8.28, optimizer 200 runs, via-ir)
 hardhat.config.cts              Hardhat config (.cts for ESM compatibility)
 ```
