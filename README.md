@@ -94,7 +94,7 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | Function | Description |
 | --- | --- |
 | `rebalance(user, fromVault, toVault, shares, feeVaults[], feeAmounts[])` | Move position between vaults with optional performance fee collection |
-| `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], tokenMessenger, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
+| `withdrawAndBridge(user, vault, shares, feeVaults[], feeAmounts[], destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold)` | Atomic withdraw + fee collection + CCTP burn |
 
 ### Relayer-only (`onlyRelayer`)
 
@@ -117,6 +117,7 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | `aavePool()` | Aave V3 Pool address (immutable, `address(0)` if not on chain) |
 | `aUsdc()` | Aave aUSDC token address (immutable, `address(0)` if not on chain) |
 | `messageTransmitter()` | CCTP V2 MessageTransmitter address (immutable) |
+| `tokenMessenger()` | CCTP V2 TokenMessenger address (immutable, `address(0)` if disabled) |
 | `executor()` | Current executor address |
 | `relayer()` | Current relayer address |
 | `approvedVaults(vault)` | Whether a vault is whitelisted |
@@ -149,7 +150,7 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 | `VaultNotApproved(address vault)` | Operation targets a vault not in the whitelist |
 | `ZeroAmount()` | Zero-amount argument where a positive value is required |
 | `ZeroAddress()` | Zero address where a non-zero address is required |
-| `InvalidInput()` | Invalid array length, empty array, `fromVault == toVault`, or `feeAmount >= shares` |
+| `InvalidInput()` | Invalid array length, empty array, or `feeAmount >= shares` |
 | `ArrayLengthMismatch()` | `feeVaults` and `feeAmounts` arrays have different lengths |
 | `CctpBurnFailed()` | Low-level call to CCTP TokenMessenger's `depositForBurn` failed |
 | `MessageRelayFailed()` | CCTP `receiveMessage` relay call returned false |
@@ -185,7 +186,6 @@ Fee arrays may be empty (no-fee operation) or contain vaults unrelated to the cu
 | `SafeERC20` | Handles non-standard ERC20 tokens (no-return, reverting on failure) |
 | Vault whitelist | Only pre-approved vault addresses can receive deposits; fee vaults must also be whitelisted |
 | Zero-address guards | Constructor and functions revert on `address(0)` for critical parameters |
-| `fromVault != toVault` guard | `rebalance` reverts if source and destination are the same vault |
 | User-callable exit (`selfBatchWithdraw`) | Trustless exit path for users independent of the rebalancer service |
 | Low-level CCTP call | Avoids proxy return-value ABI mismatch reverts on CCTP TokenMessenger |
 | Fee vault whitelist check | `_collectFees` validates each fee vault is whitelisted before transferring shares |
@@ -202,6 +202,7 @@ constructor(
     address _aavePool,
     address _aUsdc,
     address _messageTransmitter,
+    address _tokenMessenger,
     address _owner,
     address[] memory _initialVaults
 ) Ownable(_owner)
@@ -213,6 +214,7 @@ constructor(
 | `_aavePool` | No | Aave V3 Pool address. `address(0)` on chains without Aave. |
 | `_aUsdc` | No | Aave aUSDC token address. `address(0)` on chains without Aave. |
 | `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
+| `_tokenMessenger` | No | CCTP V2 TokenMessenger. `address(0)` disables CCTP burns. |
 | `_owner` | Yes | Initial owner (multisig). Reverts on `address(0)`. |
 | `_initialVaults` | No | Optional vault whitelist seeded at deploy time. Duplicates and zero addresses are silently skipped. |
 
@@ -277,10 +279,10 @@ The Hardhat test suite (`test/QuicknodeEarn.test.ts`) uses a local Hardhat netwo
 - **Deployment** — constructor args, immutable state, revert on zero USDC/owner, initial vault seeding, duplicate/zero-address skipping
 - **Vault Management** — addVault, batchAddVaults, removeVault, idempotent add, events, non-owner revert
 - **Role Management** — setExecutor, setRelayer, non-owner revert, defaults to zero address
-- **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on `fromVault == toVault` / non-approved vaults / zero shares / zero user / mismatched fee arrays / non-executor
+- **Rebalance** — vault-to-vault rebalance (no fee), fee share collection during rebalance, revert on non-approved vaults / non-executor
 - **selfBatchDeposit** — multi-vault deposit in one tx, revert on non-whitelisted / mismatched arrays / empty arrays / zero amount
 - **selfBatchWithdraw** — multi-vault withdrawal (no fees), withdrawal with fee deduction, `shares[i] == 0` full-balance mode, revert on non-whitelisted / mismatched arrays / `fee >= shares` / empty arrays
-- **Sweep** — owner sweeps fee shares, partial sweep bookkeeping, revert on zero amount / non-owner
+- **Sweep** — owner sweeps fee shares, revert on zero amount / non-owner
 - **View Functions** — `getApprovedVaults`, `isVaultApproved`, `vaultList` enumeration
 - **Ownership** — two-step ownership transfer via `transferOwnership` + `acceptOwnership`
 
@@ -308,7 +310,7 @@ The address is deterministic via CreateX CREATE3 (salt version 11).
 
 ### Scope
 
-The primary audit target is `contracts/QuicknodeEarn.sol` (~851 lines). Mock contracts (`contracts/mocks/`) and the deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
+The primary audit targets are `contracts/QuicknodeEarn.sol` (~846 lines) and `contracts/QuicknodeEarnProxy.sol` (~870 lines, UUPS proxy variant with identical business logic). Mock contracts (`contracts/mocks/`) and the deploy script (`script/Deploy.s.sol`) are out of scope for the security audit but included for test completeness.
 
 ### Trust Model Assumptions
 
@@ -329,7 +331,8 @@ The primary audit target is `contracts/QuicknodeEarn.sol` (~851 lines). Mock con
 
 ```
 contracts/
-  QuicknodeEarn.sol             Main contract (~851 lines)
+  QuicknodeEarn.sol             Main contract (~846 lines, non-proxy)
+  QuicknodeEarnProxy.sol        UUPS proxy variant (~870 lines, identical business logic)
   interfaces/
     ICreateX.sol                CreateX factory interface for deterministic deployment
   mocks/
@@ -343,6 +346,7 @@ test/
 docs/
   deployment.md                 Full deployment guide
   contract-verification.md      Source verification via Etherscan V2 API
+  laymans.md                    Plain-English security overview
 foundry.toml                    Forge config (solc 0.8.28, optimizer 200 runs, via-ir)
 hardhat.config.cts              Hardhat config (.cts for ESM compatibility)
 ```

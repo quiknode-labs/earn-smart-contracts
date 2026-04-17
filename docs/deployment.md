@@ -22,8 +22,8 @@ The QuicknodeEarn is deployed behind a **UUPS proxy**. The proxy has a permanent
 **Architecture:**
 - **Proxy** (ERC1967Proxy): deterministic address via CreateX CREATE3, never changes
 - **Implementation** (QuicknodeEarn): deployed via regular CREATE, can be upgraded
-- **Immutables** (`usdc`, `aavePool`, `aUsdc`, `messageTransmitter`): baked into each implementation's bytecode
-- **Storage** (owner, vault whitelist, fee shares): lives in the proxy, persists across upgrades
+- **Immutables** (`usdc`, `aavePool`, `aUsdc`, `messageTransmitter`, `tokenMessenger`): baked into each implementation's bytecode
+- **Storage** (owner, vault whitelist, executor, relayer): lives in the proxy, persists across upgrades
 
 ### Required env vars
 
@@ -117,13 +117,14 @@ After each deployment or upgrade, verify the **implementation** contract on the 
 
 ```bash
 source .env && cd smart-contracts
-forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:QuicknodeEarn \
+forge verify-contract <implementation_address> contracts/QuicknodeEarnProxy.sol:QuicknodeEarnProxy \
   --chain-id 8453 \
-  --constructor-args $(cast abi-encode "constructor(address,address,address,address)" \
+  --constructor-args $(cast abi-encode "constructor(address,address,address,address,address)" \
     0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
     0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 \
     0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB \
-    0x81D40F21F12A8F0E3252Bccb954D722d4c464B64) \
+    0x81D40F21F12A8F0E3252Bccb954D722d4c464B64 \
+    0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d) \
   --etherscan-api-key "$ETHERSCAN_API_KEY" \
   --watch
 ```
@@ -132,12 +133,13 @@ forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:Quick
 
 ```bash
 source .env && cd smart-contracts
-forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:QuicknodeEarn \
-  --constructor-args $(cast abi-encode "constructor(address,address,address,address)" \
+forge verify-contract <implementation_address> contracts/QuicknodeEarnProxy.sol:QuicknodeEarnProxy \
+  --constructor-args $(cast abi-encode "constructor(address,address,address,address,address)" \
     0x754704Bc059F8C67012fEd69BC8A327a5aafb603 \
     0x0000000000000000000000000000000000000000 \
     0x0000000000000000000000000000000000000000 \
-    0x0000000000000000000000000000000000000000) \
+    0x81D40F21F12A8F0E3252Bccb954D722d4c464B64 \
+    0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d) \
   --verifier etherscan \
   --verifier-url "https://api.etherscan.io/v2/api?chainid=143" \
   --verifier-api-key "$ETHERSCAN_API_KEY" \
@@ -145,7 +147,7 @@ forge verify-contract <implementation_address> contracts/QuicknodeEarn.sol:Quick
 ```
 
 **Notes:**
-- The constructor args match the immutables for each chain (USDC address, Aave Pool, aUSDC, MessageTransmitter). Monad has `address(0)` for Aave and CCTP since they're not deployed there.
+- The constructor args match the immutables for each chain (USDC, Aave Pool, aUSDC, MessageTransmitter, TokenMessenger). Monad has `address(0)` for Aave since it's not deployed there. CCTP addresses are the same on all chains.
 - You only verify the **implementation**, not the proxy. The proxy is a standard OZ ERC1967Proxy and block explorers auto-detect it.
 - The `--watch` flag polls until verification completes (usually 15-30s).
 

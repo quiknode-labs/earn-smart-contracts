@@ -6,6 +6,8 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
 /// @dev Minimal Aave V3 Pool interface for supply/withdraw
 interface IPool {
@@ -43,9 +45,11 @@ struct BridgeBurn {
     uint32  minFinalityThreshold; // 0 = fast finality (seconds), 2000 = standard finality (full chain finality)
 }
 
-/// @title QuicknodeEarn
+/// @title QuicknodeEarnProxy
 /// @notice Non-custodial yield-optimiser that moves user funds between whitelisted
 ///         Morpho (ERC4626) vaults and the Aave V3 Pool to maximise supply APY.
+///         UUPS-upgradeable variant — deploy an ERC1967 proxy pointing at this
+///         implementation and call `initialize()` once through the proxy.
 /// @dev Architecture overview:
 ///      - Users retain full custody: they grant ERC20 approvals to this contract but
 ///        never transfer principal in; all vault shares/aTokens are held by the user.
@@ -75,7 +79,10 @@ struct BridgeBurn {
 ///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
 ///        with no owner requirement, providing a trustless exit path independent of
 ///        the rebalancer.
-contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
+///      - UUPS: only the owner may authorise an upgrade (`_authorizeUpgrade`).
+///        The implementation's constructor calls `_disableInitializers()` to prevent
+///        direct initialisation of the implementation contract itself.
+contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
@@ -299,31 +306,28 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------
-    // Constructor
+    // Constructor + Initializer
     // -------------------------------------------------------------------------
 
-    /// @notice Deploy QuicknodeEarn.
-    /// @dev Sets all immutable addresses and optionally seeds the vault whitelist.
+    /// @notice Set immutable chain-specific addresses and disable initializers on the
+    ///         implementation contract itself.
+    /// @dev Called once at deployment of the implementation. The proxy delegates all
+    ///      calls (including `initialize`) to this contract, so this constructor only
+    ///      runs against the implementation's own storage — not the proxy's.
     ///      Pass `address(0)` for `_aavePool`, `_aUsdc`, and `_messageTransmitter`
     ///      on chains where those integrations are not available.
-    ///      Only `_usdc` and `_owner` must be non-zero.
     /// @param _usdc               USDC token address.
     /// @param _aavePool           Aave V3 Pool address; `address(0)` if Aave not on chain.
     /// @param _aUsdc              Aave aUSDC token address; `address(0)` if Aave not on chain.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
     /// @param _tokenMessenger     CCTP V2 TokenMessenger; `address(0)` disables CCTP burns.
-    /// @param _owner              Initial owner. Receives all owner privileges.
-    /// @param _initialVaults      Optional list of vaults to whitelist atomically.
-    ///                            Duplicates and zero addresses are silently skipped.
     constructor(
         address _usdc,
         address _aavePool,
         address _aUsdc,
         address _messageTransmitter,
-        address _tokenMessenger,
-        address _owner,
-        address[] memory _initialVaults
-    ) Ownable(_owner) {
+        address _tokenMessenger
+    ) Ownable(msg.sender) {
         if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
@@ -331,6 +335,20 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         aUsdc              = _aUsdc;
         messageTransmitter = _messageTransmitter;
         tokenMessenger     = _tokenMessenger;
+
+        _disableInitializers();
+    }
+
+    /// @notice Initialise the proxy — sets the owner and seeds the vault whitelist.
+    /// @dev Must be called exactly once, through the proxy, immediately after deployment.
+    ///      Protected by the `initializer` modifier from `Initializable`.
+    /// @param _owner         Initial owner. Receives all owner privileges.
+    /// @param _initialVaults Optional list of vaults to whitelist atomically.
+    ///                       Duplicates and zero addresses are silently skipped.
+    function initialize(address _owner, address[] calldata _initialVaults) external initializer {
+        if (_owner == address(0)) revert ZeroAddress();
+
+        _transferOwnership(_owner);
 
         for (uint256 i = 0; i < _initialVaults.length; i++) {
             address vault = _initialVaults[i];
@@ -341,6 +359,13 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // UUPS: Upgrade authorisation
+    // -------------------------------------------------------------------------
+
+    /// @dev Only the owner may authorise a contract upgrade.
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     // -------------------------------------------------------------------------
     // Owner-only: Vault management
@@ -843,4 +868,3 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         return approvedVaults[vault];
     }
 }
-

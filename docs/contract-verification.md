@@ -22,47 +22,39 @@ Set `ETHERSCAN_API_KEY` in your `.env` (one key works for all chains via V2).
 ## Step 1 — Flatten the contract
 
 ```bash
-forge flatten contracts/QuicknodeEarn.sol > /tmp/QuicknodeEarn_flat.sol
+forge flatten contracts/QuicknodeEarnProxy.sol > /tmp/QuicknodeEarnProxy_flat.sol
 ```
 
 ## Step 2 — Encode constructor args
 
 Use `cast abi-encode` with the constructor signature and the exact args passed at deploy time. Output is hex with a `0x` prefix — strip the prefix before sending to the API.
 
-**Monad example (no Aave, 5 vaults):**
+**Monad example (no Aave):**
 
 ```bash
 source .env
 
-VAULTS="[0x78999cc96d2Ba0341588C60CcB0E91c6C33CF371,...]"
-
 ARGS=$(cast abi-encode \
-  "constructor(address,address,address,address,address,address[],uint16,address)" \
+  "constructor(address,address,address,address,address)" \
   0x754704Bc059F8C67012fEd69BC8A327a5aafb603 `# usdc` \
   0x0000000000000000000000000000000000000000 `# aavePool (none)` \
   0x0000000000000000000000000000000000000000 `# aUsdc (none)` \
   0x81D40F21F12A8F0E3252Bccb954D722d4c464B64 `# messageTransmitter` \
-  0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9 `# owner` \
-  "$VAULTS" \
-  50 `# maxFeeBps` \
-  0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9) `# feeRecipient`
+  0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d) `# tokenMessenger`
 
 ARGS_RAW="${ARGS#0x}"   # strip 0x prefix
 ```
 
-**Base example (with Aave, 43 vaults):**
+**Base example (with Aave):**
 
 ```bash
 ARGS=$(cast abi-encode \
-  "constructor(address,address,address,address,address,address[],uint16,address)" \
+  "constructor(address,address,address,address,address)" \
   0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 `# usdc` \
-  0xa238dd80c259a72e81d7e4664a9801593f98d1c5 `# aavePool` \
+  0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 `# aavePool` \
   0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB `# aUsdc` \
   0x81D40F21F12A8F0E3252Bccb954D722d4c464B64 `# messageTransmitter` \
-  0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9 `# owner` \
-  "$VAULTS" \
-  50 `# maxFeeBps` \
-  0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9) `# feeRecipient`
+  0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d) `# tokenMessenger`
 
 ARGS_RAW="${ARGS#0x}"
 ```
@@ -81,9 +73,9 @@ curl -s -X POST "https://api.etherscan.io/v2/api?chainid=<CHAIN_ID>" \
   --data-urlencode "action=verifysourcecode" \
   --data-urlencode "apikey=$ETHERSCAN_API_KEY" \
   --data-urlencode "contractaddress=<CONTRACT_ADDRESS>" \
-  --data-urlencode "sourceCode=$(cat /tmp/QuicknodeEarn_flat.sol)" \
+  --data-urlencode "sourceCode=$(cat /tmp/QuicknodeEarnProxy_flat.sol)" \
   --data-urlencode "codeformat=solidity-single-file" \
-  --data-urlencode "contractname=QuicknodeEarn" \
+  --data-urlencode "contractname=QuicknodeEarnProxy" \
   --data-urlencode "compilerversion=v0.8.28+commit.7893614a" \
   --data-urlencode "optimizationUsed=1" \
   --data-urlencode "runs=200" \
@@ -122,7 +114,7 @@ Success:
 Find the exact version from the build artifact:
 
 ```bash
-cat out/QuicknodeEarn.sol/QuicknodeEarn.json \
+cat out/QuicknodeEarnProxy.sol/QuicknodeEarnProxy.json \
   | python3 -c "import json,sys; m=json.load(sys.stdin)['metadata']; print(m['compiler']['version'])"
 ```
 
