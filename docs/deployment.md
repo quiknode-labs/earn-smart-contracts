@@ -31,15 +31,15 @@ All deploy/upgrade/verify commands require these in `.env` (or exported in shell
 
 | Variable | Purpose |
 |----------|---------|
-| `PRIVATE_KEY` | Deployer/owner wallet private key (must have ETH for gas on target chain) |
-| `BASE_RPC_URL` | Base RPC endpoint |
-| `MONAD_RPC_URL` | Monad RPC endpoint |
-| `ETHERSCAN_API_KEY` | For contract verification (free at basescan.org/apis, works for both chains via Etherscan v2) |
+| `PRIVATE_KEY` | Deployer/owner wallet private key. Must hold the proxy `owner()` (currently the same EOA as `EXECUTOR_ADDRESS`) — `executeUpgrade` reverts otherwise. Set as `PRIVATE_KEY=$EXECUTOR_PRIVATE_KEY` before running. |
+| `<CHAIN>_RPC_URL` | RPC endpoint per chain (`ETHEREUM_RPC_URL`, `OPTIMISM_RPC_URL`, `UNICHAIN_RPC_URL`, `POLYGON_RPC_URL`, `MONAD_RPC_URL`, `BASE_RPC_URL`, `ARBITRUM_RPC_URL`). |
+| `ETHERSCAN_API_KEY` | For contract verification (works across all 7 chains via Etherscan v2 API). |
 
-Forge reads `PRIVATE_KEY` from the environment automatically. Source the `.env` file before running:
+Forge reads `PRIVATE_KEY` from the environment automatically. Typical setup:
 
 ```bash
 source .env
+export PRIVATE_KEY=$EXECUTOR_PRIVATE_KEY   # required: must equal proxy owner
 ```
 
 ### Build
@@ -51,22 +51,22 @@ forge build --no-cache   # --no-cache ensures the artifact reflects latest sourc
 
 ### First Deployment (proxy + implementation)
 
-Deploys the implementation contract and the deterministic ERC1967 proxy. The proxy calls `initialize(owner, vaults)` in its constructor. If an old contract exists at the `OLD_CONTRACT` address in `Deploy.s.sol`, its vault whitelist is automatically seeded into the new proxy via `initialize()`.
+Deploys the implementation contract and the deterministic ERC1967 proxy via CreateX CREATE3. The proxy address `0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2` is the same on every chain.
+
+`deployProxy(chainId)` seeds the vault whitelist from `OLD_CONTRACT` if it exists; `deployProxyWithVaults(chainId, vaults)` takes an explicit list.
 
 ```bash
-source .env && cd smart-contracts
-
-# Base
+# Seed-from-old-contract path
 forge script script/Deploy.s.sol \
   --rpc-url "$BASE_RPC_URL" \
   --broadcast \
-  --sig "run(uint32)" 8453
+  --sig "deployProxy(uint32)" 8453
 
-# Monad
+# Explicit vault list path
 forge script script/Deploy.s.sol \
-  --rpc-url "$MONAD_RPC_URL" \
+  --rpc-url "$BASE_RPC_URL" \
   --broadcast \
-  --sig "run(uint32)" 143
+  --sig "deployProxyWithVaults(uint32,address[])" 8453 "[0x...]"
 ```
 
 **After first deploy only:**
@@ -79,25 +79,50 @@ forge script script/Deploy.s.sol \
 
 ### Upgrades (new implementation behind existing proxy)
 
-Deploys a new implementation and calls `upgradeToAndCall` on the existing proxy. Storage (owner, vault whitelist, fee shares) is preserved -- no re-initialization needed.
+`executeUpgrade(uint32)` deploys a new implementation and calls `upgradeToAndCall` on the existing proxy in a single broadcast. Reverts up front if `deployer != proxy.owner()`. Storage (owner, executor, relayer, approvedVaults, vaultList) is preserved automatically.
 
 ```bash
-source .env && cd smart-contracts
-
-# Base
 forge script script/Deploy.s.sol \
   --rpc-url "$BASE_RPC_URL" \
   --broadcast \
-  --sig "upgrade(uint32)" 8453
-
-# Monad
-forge script script/Deploy.s.sol \
-  --rpc-url "$MONAD_RPC_URL" \
-  --broadcast \
-  --sig "upgrade(uint32)" 143
+  --sig "executeUpgrade(uint32)" 8453
 ```
 
-**No address changes needed on upgrade.** The proxy address stays the same. All env vars, Vercel config, Supabase, and frontend references remain unchanged.
+If the proxy owner is separate from the deployer (e.g. migrated to a multisig), use `deployProxyImpl(uint32)` instead — it deploys the impl only and prints the address. The owner then calls `upgradeToAndCall(newImpl, "")` on the proxy in a separate tx.
+
+**Suggested rollout pattern** (used for the 2026-04-27 aUsdc fix):
+
+1. Pre-flight: cast-call `owner()`, `executor()`, `relayer()`, EIP-1967 impl slot on each chain. Record baseline.
+2. Canary: `executeUpgrade(10)` on Optimism. Re-read the same values; confirm only impl changed.
+3. Watch the next executor tick (`service_logs`) for any `VaultNotApproved` or other reverts.
+4. If clean, fan out to remaining 6 chains.
+5. Verify each new impl on its block explorer (next section).
+6. Update `multichain-deployments.md` with the new impl addresses.
+
+**Per-chain gas reminder:** every chain's executor wallet must have native gas for ~3.5M gas (impl deploy + upgrade). Ethereum is the gotcha — needs ~0.02 ETH at typical gas. `cast balance $EXECUTOR_ADDRESS --rpc-url $X_RPC_URL` to check before running.
+
+**Monad caveat:** the combined-broadcast `executeUpgrade` may revert on Monad (observed 2026-04-27). The impl deploy succeeds; the `upgradeToAndCall` is what reverts. Workaround: capture the deployed impl address from the failed run, then run `cast send $PROXY 'upgradeToAndCall(address,bytes)' <newImpl> 0x --rpc-url $MONAD_RPC_URL --private-key $PRIVATE_KEY` directly.
+
+**No address changes on upgrade.** The proxy address stays the same. All env vars, Vercel config, Supabase, and frontend references remain unchanged.
+
+### ⚠️ OpenZeppelin version pin — DO NOT BUMP
+
+The Foundry lib at `lib/openzeppelin-contracts/` **must stay at v5.0.0** (matching `foundry.lock`). OZ moved `ReentrancyGuard._status` from regular storage to ERC-7201 namespace storage in v5.5.0. The originally deployed implementations occupy slot 2 with `_status`; bumping the lib past 5.4.x would compile new impls without that slot, shifting `approvedVaults` / `vaultList` / `executor` / `relayer` up by one — every read on the live proxy would corrupt.
+
+Symptoms of a layout drift if it slips through: post-upgrade `executor()` returns `0x...0004`, `vaultList` reads as empty, etc. (Observed and rolled back on Optimism on 2026-04-27.)
+
+To verify the lib is on 5.0.0 before any deploy:
+
+```bash
+cat lib/openzeppelin-contracts/package.json | grep version    # must say "5.0.0"
+```
+
+If a fresh clone or `forge install` upgraded the lib, restore via:
+
+```bash
+rm -rf lib/openzeppelin-contracts
+forge install OpenZeppelin/openzeppelin-contracts@v5.0.0
+```
 
 **If the upgrade adds new storage variables** that need initialization, use the `reinitializer(N)` pattern in the new implementation:
 

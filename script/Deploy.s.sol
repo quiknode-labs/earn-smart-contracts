@@ -12,26 +12,9 @@ interface IExistingRebalancer {
     function getApprovedVaults() external view returns (address[] memory);
 }
 
-/// @dev Production deployment script for QuicknodeEarn (legacy non-upgradeable) and
-///      QuicknodeEarnProxy (UUPS) via CreateX CREATE3.
-///
-///      Legacy non-upgradeable deploy:
-///        forge script script/Deploy.s.sol --rpc-url $X_RPC_URL --broadcast \
-///          --sig "run(uint32)" 8453
-///        forge script script/Deploy.s.sol --rpc-url $X_RPC_URL --broadcast \
-///          --sig "runWithVaults(uint32,address[])" 8453 "[0x...]"
-///
-///      Initial UUPS proxy deploy (deterministic proxy address via CREATE3):
-///        forge script script/Deploy.s.sol --rpc-url $X_RPC_URL --broadcast \
-///          --sig "deployProxy(uint32)" 8453
-///        forge script script/Deploy.s.sol --rpc-url $X_RPC_URL --broadcast \
-///          --sig "deployProxyWithVaults(uint32,address[])" 8453 "[0x...]"
-///
-///      Upgrade existing UUPS proxy (impl-only — multisig signs upgradeToAndCall):
-///        forge script script/Deploy.s.sol --rpc-url $X_RPC_URL --broadcast \
-///          --sig "deployProxyImpl(uint32)" 8453
-///        Then the proxy owner (multisig) calls upgradeToAndCall(newImpl, "")
-///        on 0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2 in a separate tx.
+/// @dev Deploy/upgrade entry points for QuicknodeEarn (legacy) and QuicknodeEarnProxy (UUPS).
+///      Functions: run, runWithVaults, deployProxy, deployProxyWithVaults, deployProxyImpl, executeUpgrade.
+///      All read PRIVATE_KEY from env. See deployment.md for invocation.
 contract DeployQuicknodeEarn is Script {
     // CreateX factory — same address on all EVM chains
     address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
@@ -326,14 +309,8 @@ contract DeployQuicknodeEarn is Script {
         console.log("USDC:       ", address(rebalancer.usdc()));
     }
 
-    /// @notice Deploy a new QuicknodeEarnProxy implementation only (for upgrades).
-    ///         The deployer no longer owns the production proxies — ownership has
-    ///         been transferred to a multisig — so this script does NOT call
-    ///         upgradeToAndCall. After the new impl is deployed, the multisig owner
-    ///         must call upgradeToAndCall(newImpl, "") on the proxy in a separate tx.
-    ///         Storage layout, executor, and relayer settings are preserved across
-    ///         the upgrade.
-    /// @return impl Address of the freshly deployed implementation.
+    /// @notice Deploy a new impl without upgrading. Owner must call upgradeToAndCall separately.
+    ///         For the current setup where owner == deployer, use executeUpgrade instead.
     function deployProxyImpl(uint32 chainId) external returns (address impl) {
         ChainConfig memory cfg = getConfig(chainId);
 
@@ -358,6 +335,52 @@ contract DeployQuicknodeEarn is Script {
         console.log("USDC:        ", cfg.usdc);
         console.log("aavePool:    ", cfg.aavePool);
         console.log("aUsdc:       ", cfg.aUsdc);
-        console.log("Next step:   multisig calls upgradeToAndCall(newImpl, \"\") on the proxy");
+        console.log("Next step:   owner calls upgradeToAndCall(newImpl, \"\") on the proxy");
+    }
+
+    /// @notice Deploy a new impl and upgrade the proxy at 0xcc204B…70d2 in one broadcast.
+    ///         Reverts if deployer != owner.
+    function executeUpgrade(uint32 chainId) external {
+        ChainConfig memory cfg = getConfig(chainId);
+
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address deployer    = vm.addr(deployerKey);
+        address proxy       = 0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2;
+
+        require(proxy.code.length > 0, "Proxy not deployed on this chain");
+
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
+        require(rebalancer.owner() == deployer, "Deployer is not proxy owner");
+
+        console.log("=== Execute upgrade ===");
+        console.log("Chain ID:        ", chainId);
+        console.log("Proxy:           ", proxy);
+        console.log("Deployer:        ", deployer);
+
+        vm.startBroadcast(deployerKey);
+
+        // Step 1: Deploy new implementation with this chain's per-chain immutables.
+        QuicknodeEarnProxy newImpl = new QuicknodeEarnProxy(
+            cfg.usdc,
+            cfg.aavePool,
+            cfg.aUsdc,
+            cfg.msgTransmitter,
+            cfg.tokenMessenger
+        );
+
+        // Step 2: Point the proxy at the new implementation. Empty initData — no
+        //         re-initialisation needed (no new storage variables).
+        rebalancer.upgradeToAndCall(address(newImpl), "");
+
+        vm.stopBroadcast();
+
+        // Verify state is preserved.
+        console.log("New impl:        ", address(newImpl));
+        console.log("Owner (kept):    ", rebalancer.owner());
+        console.log("Executor (kept): ", rebalancer.executor());
+        console.log("Relayer (kept):  ", rebalancer.relayer());
+        console.log("Vaults (kept):   ", rebalancer.getApprovedVaults().length);
+        console.log("USDC:            ", address(rebalancer.usdc()));
+        console.log("aUsdc:           ", rebalancer.aUsdc());
     }
 }

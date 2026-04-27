@@ -419,15 +419,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     // Internal: Performance fee extraction
     // -------------------------------------------------------------------------
 
-    /// @dev Transfer vault shares from `user` to this contract as a performance fee.
-    ///      Accepts either a whitelisted ERC4626 (Morpho) vault or `aUsdc` — the latter
-    ///      lets the executor charge fees on Aave-source rebalances/bridges without
-    ///      adding aUSDC to `approvedVaults` (which would mis-route deposits/withdraws
-    ///      through the ERC4626 branch). Mirrors the aUSDC carve-out in `selfBatchWithdraw`.
-    ///      `feeVaults` may contain vaults unrelated to the current `fromVault`/`toVault`
-    ///      pair — the executor collects fees from ALL strategy vaults with accrued yield
-    ///      in a single call to amortise gas.
-    ///      Emits `PerformanceFeeCollected` if at least one fee entry is present.
+    /// @dev aUsdc is accepted as a fee vault even though it isn't in `approvedVaults`
+    ///      — it's the Aave receipt token, not an ERC4626 vault.
     function _collectFees(
         address user,
         address[] calldata feeVaults,
