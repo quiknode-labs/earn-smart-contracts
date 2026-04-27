@@ -420,8 +420,10 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @dev Transfer vault shares from `user` to this contract as a performance fee.
-    ///      Only ERC4626 (Morpho) vaults are supported here — Aave fees use aUSDC and
-    ///      are handled inline by `selfBatchWithdraw`. Each fee vault must be whitelisted.
+    ///      Accepts either a whitelisted ERC4626 (Morpho) vault or `aUsdc` — the latter
+    ///      lets the executor charge fees on Aave-source rebalances/bridges without
+    ///      adding aUSDC to `approvedVaults` (which would mis-route deposits/withdraws
+    ///      through the ERC4626 branch). Mirrors the aUSDC carve-out in `selfBatchWithdraw`.
     ///      `feeVaults` may contain vaults unrelated to the current `fromVault`/`toVault`
     ///      pair — the executor collects fees from ALL strategy vaults with accrued yield
     ///      in a single call to amortise gas.
@@ -433,8 +435,10 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ) internal {
         if (feeVaults.length == 0) return;
         for (uint256 i = 0; i < feeVaults.length; i++) {
-            if (!approvedVaults[feeVaults[i]]) revert VaultNotApproved(feeVaults[i]);
-            IERC20(feeVaults[i]).safeTransferFrom(user, address(this), feeAmounts[i]);
+            address fv = feeVaults[i];
+            if (fv == address(0)) revert ZeroAddress();
+            if (fv != aUsdc && !approvedVaults[fv]) revert VaultNotApproved(fv);
+            IERC20(fv).safeTransferFrom(user, address(this), feeAmounts[i]);
         }
         emit PerformanceFeeCollected(user, feeVaults, feeAmounts);
     }
