@@ -69,12 +69,12 @@ describe("QuicknodeEarn", function () {
     ]);
 
     // Deploy QuicknodeEarn behind proxy
-    // Use owner address as placeholder for aavePool/aUsdc (not exercised in non-Aave tests)
+    // aavePool/aUsdc set to zero (Aave integration removed)
     // address(0) for messageTransmitter — CCTP not exercised in these tests
     const rebalancer = await deployBehindProxy(
       usdc.address,
-      owner.account.address, // aavePool placeholder
-      owner.account.address, // aUsdc placeholder
+      ZERO_ADDRESS as `0x${string}`, // aavePool (deprecated)
+      ZERO_ADDRESS as `0x${string}`, // aUsdc (deprecated)
       ZERO_ADDRESS as `0x${string}`, // messageTransmitter (disabled)
       ZERO_ADDRESS as `0x${string}`, // tokenMessenger (disabled)
       owner.account.address, // owner
@@ -115,13 +115,13 @@ describe("QuicknodeEarn", function () {
       );
     });
 
-    it("should set aavePool and aUsdc", async function () {
-      const { rebalancer, owner } = await loadFixture(deployFixture);
+    it("should set aavePool and aUsdc to zero (deprecated)", async function () {
+      const { rebalancer } = await loadFixture(deployFixture);
       expect(getAddress(await rebalancer.read.aavePool())).to.equal(
-        getAddress(owner.account.address)
+        getAddress(ZERO_ADDRESS)
       );
       expect(getAddress(await rebalancer.read.aUsdc())).to.equal(
-        getAddress(owner.account.address)
+        getAddress(ZERO_ADDRESS)
       );
     });
 
@@ -496,171 +496,6 @@ describe("QuicknodeEarn", function () {
           [],
         ])
       ).to.be.rejectedWith("0x83906042"); // UnauthorizedExecutor()
-    });
-  });
-
-  // --- Aave fee path (aUsdc as feeVault) ---
-  //
-  // _collectFees must accept aUsdc as a fee vault without requiring it to be in
-  // approvedVaults — aUSDC is the Aave receipt token, not a Morpho vault, so
-  // routing it through the ERC4626 deposit/withdraw branches would be wrong.
-  // This carve-out mirrors the inline aUSDC handling in selfBatchWithdraw and
-  // covers both rebalance() and withdrawAndBridge() (both call _collectFees).
-
-  describe("Aave fee path (aUsdc as feeVault)", function () {
-    async function aUsdcFixture() {
-      const [owner, user, other] = await hre.viem.getWalletClients();
-      const publicClient = await hre.viem.getPublicClient();
-
-      const usdc = await hre.viem.deployContract("MockERC20", [
-        "USD Coin",
-        "USDC",
-        6,
-      ]);
-      // Use a real ERC20 to stand in for aUSDC so safeTransferFrom works.
-      const aUsdcMock = await hre.viem.deployContract("MockERC20", [
-        "Aave USDC",
-        "aUSDC",
-        6,
-      ]);
-      const vaultA = await hre.viem.deployContract("MockERC4626", [
-        usdc.address,
-        "Vault A Shares",
-        "vA",
-      ]);
-      const vaultB = await hre.viem.deployContract("MockERC4626", [
-        usdc.address,
-        "Vault B Shares",
-        "vB",
-      ]);
-
-      const rebalancer = await deployBehindProxy(
-        usdc.address,
-        owner.account.address,        // aavePool placeholder (deposit/withdraw routing not exercised here)
-        aUsdcMock.address,            // aUsdc — real ERC20 so the fee transferFrom can be observed
-        ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
-        owner.account.address,
-        [],
-      );
-
-      await rebalancer.write.addVault([vaultA.address]);
-      await rebalancer.write.addVault([vaultB.address]);
-      await rebalancer.write.setExecutor([owner.account.address]);
-
-      // Seed user with USDC and deposit into vaultA so we have a position to rebalance
-      const depositAmount = parseUnits("1000", 6);
-      await usdc.write.mint([user.account.address, depositAmount]);
-
-      const usdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        usdc.address,
-        { client: { wallet: user } }
-      );
-      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
-
-      const rebalancerAsUser = await hre.viem.getContractAt(
-        "QuicknodeEarnProxy",
-        rebalancer.address,
-        { client: { wallet: user } }
-      );
-      await rebalancerAsUser.write.selfBatchDeposit([
-        [vaultA.address],
-        [depositAmount],
-        [],
-      ]);
-
-      const userShares = await vaultA.read.balanceOf([user.account.address]);
-
-      // User approves rebalancer to pull vaultA shares (the rebalance leg).
-      const vaultAAsUser = await hre.viem.getContractAt(
-        "MockERC4626",
-        vaultA.address,
-        { client: { wallet: user } }
-      );
-      await vaultAAsUser.write.approve([rebalancer.address, userShares]);
-
-      // Mint user a fake aUSDC balance simulating an Aave position, and approve
-      // the rebalancer to pull the fee.
-      const aUsdcBalance = parseUnits("100", 6);
-      await aUsdcMock.write.mint([user.account.address, aUsdcBalance]);
-      const aUsdcAsUser = await hre.viem.getContractAt(
-        "MockERC20",
-        aUsdcMock.address,
-        { client: { wallet: user } }
-      );
-      await aUsdcAsUser.write.approve([rebalancer.address, aUsdcBalance]);
-
-      return {
-        rebalancer,
-        usdc,
-        aUsdcMock,
-        vaultA,
-        vaultB,
-        owner,
-        user,
-        other,
-        publicClient,
-        depositAmount,
-        userShares,
-        aUsdcBalance,
-      };
-    }
-
-    it("rebalance accepts aUsdc as feeVault and pulls aUSDC from user", async function () {
-      const { rebalancer, aUsdcMock, vaultA, vaultB, user, userShares } =
-        await loadFixture(aUsdcFixture);
-
-      const feeShares = parseUnits("0.5", 6); // 0.5 aUSDC fee
-
-      await rebalancer.write.rebalance([
-        user.account.address,
-        vaultA.address,
-        vaultB.address,
-        userShares,
-        [aUsdcMock.address],
-        [feeShares],
-      ]);
-
-      // The contract should now hold the aUSDC fee that was pulled from the user
-      const rebalancerAUsdc = await aUsdcMock.read.balanceOf([rebalancer.address]);
-      expect(rebalancerAUsdc).to.equal(feeShares);
-
-      // vaultB should have received the user's USDC
-      const userSharesB = await vaultB.read.balanceOf([user.account.address]);
-      expect(userSharesB > 0n).to.be.true;
-    });
-
-    it("rebalance reverts VaultNotApproved when feeVault is neither aUsdc nor whitelisted", async function () {
-      const { rebalancer, vaultA, vaultB, user, other, userShares } =
-        await loadFixture(aUsdcFixture);
-
-      await expect(
-        rebalancer.write.rebalance([
-          user.account.address,
-          vaultA.address,
-          vaultB.address,
-          userShares,
-          [other.account.address], // arbitrary EOA — not aUsdc, not in approvedVaults
-          [1n],
-        ])
-      ).to.be.rejectedWith("VaultNotApproved");
-    });
-
-    it("rebalance reverts ZeroAddress when feeVault is address(0)", async function () {
-      const { rebalancer, vaultA, vaultB, user, userShares } =
-        await loadFixture(aUsdcFixture);
-
-      await expect(
-        rebalancer.write.rebalance([
-          user.account.address,
-          vaultA.address,
-          vaultB.address,
-          userShares,
-          [ZERO_ADDRESS as `0x${string}`],
-          [1n],
-        ])
-      ).to.be.rejectedWith("ZeroAddress");
     });
   });
 

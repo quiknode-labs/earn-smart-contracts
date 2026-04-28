@@ -7,12 +7,6 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-/// @dev Minimal Aave V3 Pool interface for supply/withdraw
-interface IPool {
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-}
-
 /// @dev Minimal CCTP V2 MessageTransmitter interface for relaying messages
 interface IMessageTransmitter {
     function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool);
@@ -45,10 +39,10 @@ struct BridgeBurn {
 
 /// @title QuicknodeEarn
 /// @notice Non-custodial yield-optimiser that moves user funds between whitelisted
-///         Morpho (ERC4626) vaults and the Aave V3 Pool to maximise supply APY.
+///         ERC4626 vaults (Morpho) to maximise supply APY.
 /// @dev Architecture overview:
 ///      - Users retain full custody: they grant ERC20 approvals to this contract but
-///        never transfer principal in; all vault shares/aTokens are held by the user.
+///        never transfer principal in; all vault shares are held by the user.
 ///      - Three privileged roles:
 ///        - **Owner** (multisig): vault whitelist, fee sweeps, role assignment.
 ///        - **Executor**: calls `rebalance` and `withdrawAndBridge` to move capital.
@@ -85,14 +79,14 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @notice The USDC token this contract operates on.
     IERC20  public immutable usdc;
 
-    /// @notice The Aave V3 Pool contract address.
-    ///         When `vault == aavePool`, deposit/withdraw routes through `IPool`.
-    ///         May be `address(0)` on chains where Aave V3 is not deployed.
+    /// @notice Preserved for ABI backwards compatibility with the previously deployed
+    ///         implementation. Aave integration has been removed; always `address(0)`
+    ///         in new deployments.
     address public immutable aavePool;
 
-    /// @notice The Aave aUSDC (interest-bearing) token address.
-    ///         Used to pull the user's aUSDC balance when withdrawing from Aave.
-    ///         May be `address(0)` on chains where Aave V3 is not deployed.
+    /// @notice Preserved for ABI backwards compatibility with the previously deployed
+    ///         implementation. Aave integration has been removed; always `address(0)`
+    ///         in new deployments.
     address public immutable aUsdc;
 
     /// @notice The CCTP V2 MessageTransmitter address for relaying bridge messages.
@@ -143,10 +137,10 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     event VaultRemoved(address indexed vault);
 
     /// @notice Emitted after a successful single-vault deposit.
-    /// @param user            The user who owns the resulting shares/aTokens.
-    /// @param vault           The vault or Aave Pool that received USDC.
+    /// @param user            The user who owns the resulting vault shares.
+    /// @param vault           The ERC4626 vault that received USDC.
     /// @param usdcAmount      USDC deposited (6 decimals).
-    /// @param sharesReceived  Vault shares minted (or aUSDC received for Aave, ~1:1).
+    /// @param sharesReceived  Vault shares minted.
     event Deposited(
         address indexed user,
         address indexed vault,
@@ -158,7 +152,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @param user       The user whose position was moved.
     /// @param fromVault  The vault that was withdrawn from.
     /// @param toVault    The vault that received the re-deposited USDC.
-    /// @param shares     Shares (or aUSDC) pulled from `fromVault`.
+    /// @param shares     ERC4626 shares pulled from `fromVault`.
     /// @param usdcAmount USDC received on withdrawal (full amount deposited into toVault).
     event Rebalanced(
         address indexed user,
@@ -179,7 +173,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @notice Emitted for each vault leg of a `selfBatchWithdraw` call.
     /// @param user        The user whose position was closed.
     /// @param vault       The vault that was withdrawn from.
-    /// @param shares      Net shares (or aUSDC) redeemed after fee deduction.
+    /// @param shares      Net ERC4626 shares redeemed after fee deduction.
     /// @param usdcReceived USDC returned to the user.
     event StrategyExited(
         address indexed user,
@@ -213,7 +207,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @notice Emitted after `withdrawAndBridge` burns USDC via CCTP.
     /// @param user       User whose vault position was bridged.
     /// @param vault      The vault that was withdrawn from.
-    /// @param shares     Shares (or aUSDC) redeemed.
+    /// @param shares     ERC4626 shares redeemed.
     /// @param usdcBurned USDC sent to the CCTP TokenMessenger for burning.
     /// @param destDomain CCTP destination domain ID.
     event BridgeInitiated(
@@ -228,7 +222,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @param user           User who receives the vault shares.
     /// @param vault          Destination vault.
     /// @param usdcAmount     USDC deposited.
-    /// @param sharesReceived Shares minted (or aUSDC for Aave, ~1:1).
+    /// @param sharesReceived ERC4626 shares minted.
     event DepositedFromBridge(
         address indexed user,
         address indexed vault,
@@ -304,12 +298,12 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
 
     /// @notice Deploy QuicknodeEarn.
     /// @dev Sets all immutable addresses and optionally seeds the vault whitelist.
-    ///      Pass `address(0)` for `_aavePool`, `_aUsdc`, and `_messageTransmitter`
-    ///      on chains where those integrations are not available.
-    ///      Only `_usdc` and `_owner` must be non-zero.
+    ///      `_aavePool` and `_aUsdc` are preserved for ABI backwards compatibility —
+    ///      pass `address(0)` for both in new deployments. Only `_usdc` and `_owner`
+    ///      must be non-zero.
     /// @param _usdc               USDC token address.
-    /// @param _aavePool           Aave V3 Pool address; `address(0)` if Aave not on chain.
-    /// @param _aUsdc              Aave aUSDC token address; `address(0)` if Aave not on chain.
+    /// @param _aavePool           Deprecated (Aave removed). Pass `address(0)`.
+    /// @param _aUsdc              Deprecated (Aave removed). Pass `address(0)`.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
     /// @param _tokenMessenger     CCTP V2 TokenMessenger; `address(0)` disables CCTP burns.
     /// @param _owner              Initial owner. Receives all owner privileges.
@@ -419,8 +413,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     // Internal: Performance fee extraction
     // -------------------------------------------------------------------------
 
-    /// @dev aUsdc is accepted as a fee vault even though it isn't in `approvedVaults`
-    ///      — it's the Aave receipt token, not an ERC4626 vault.
+    /// @dev Transfer fee shares from the user to this contract for each fee vault.
+    ///      Every fee vault must be in `approvedVaults`.
     function _collectFees(
         address user,
         address[] calldata feeVaults,
@@ -430,35 +424,22 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         for (uint256 i = 0; i < feeVaults.length; i++) {
             address fv = feeVaults[i];
             if (fv == address(0)) revert ZeroAddress();
-            if (fv != aUsdc && !approvedVaults[fv]) revert VaultNotApproved(fv);
+            if (!approvedVaults[fv]) revert VaultNotApproved(fv);
             IERC20(fv).safeTransferFrom(user, address(this), feeAmounts[i]);
         }
         emit PerformanceFeeCollected(user, feeVaults, feeAmounts);
     }
 
-    /// @dev Deposit USDC into a vault on behalf of `user`. Routes through Aave Pool
-    ///      or ERC4626 depending on vault address.
+    /// @dev Deposit USDC into an ERC4626 vault on behalf of `user`.
     function _depositToVault(address vault, uint256 amount, address user) internal returns (uint256 sharesReceived) {
-        if (vault == aavePool) {
-            usdc.forceApprove(aavePool, amount);
-            IPool(aavePool).supply(address(usdc), amount, user, 0);
-            return amount;
-        } else {
-            usdc.forceApprove(vault, amount);
-            return IERC4626(vault).deposit(amount, user);
-        }
+        usdc.forceApprove(vault, amount);
+        return IERC4626(vault).deposit(amount, user);
     }
 
-    /// @dev Pull vault shares from `user` and redeem to USDC held by this contract.
-    ///      Routes through Aave Pool or ERC4626 depending on vault address.
+    /// @dev Pull ERC4626 vault shares from `user` and redeem to USDC held by this contract.
     function _withdrawFromVault(address vault, address user, uint256 shares) internal returns (uint256 usdcReceived) {
-        if (vault == aavePool) {
-            IERC20(aUsdc).safeTransferFrom(user, address(this), shares);
-            usdcReceived = IPool(aavePool).withdraw(address(usdc), shares, address(this));
-        } else {
-            IERC20(vault).safeTransferFrom(user, address(this), shares);
-            usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
-        }
+        IERC20(vault).safeTransferFrom(user, address(this), shares);
+        usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
     }
 
     /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger (low-level call to avoid
@@ -496,12 +477,12 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///      2. Pull `shares` from `fromVault` and redeem to USDC.
     ///      3. Deposit full USDC amount into `toVault` on behalf of `user`.
     ///      Pass empty arrays for `feeVaults`/`feeAmounts` to perform a no-fee rebalance.
-    ///      The user must have pre-approved this contract to spend their `fromVault` token
-    ///      (ERC4626 shares or aUSDC) and any fee vault tokens before the rebalancer calls this.
+    ///      The user must have pre-approved this contract to spend their `fromVault`
+    ///      ERC4626 shares and any fee vault tokens before the rebalancer calls this.
     /// @param user       The user whose position is being rebalanced.
     /// @param fromVault  The vault to withdraw from. Must be whitelisted.
     /// @param toVault    The vault to deposit into. Must be whitelisted.
-    /// @param shares     ERC4626 shares (Morpho) or aUSDC amount (Aave) to move.
+    /// @param shares     ERC4626 shares to move.
     /// @param feeVaults  Vault addresses from which to collect performance fee shares.
     ///                   May be empty (no fee) or contain vaults outside the rebalance pair.
     /// @param feeAmounts Corresponding share amounts to collect from each vault in `feeVaults`.
@@ -545,7 +526,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///      Performance fees are collected as vault shares before the withdrawal.
     /// @param user                  The user whose vault position is bridged.
     /// @param vault                 The vault to withdraw from. Must be whitelisted.
-    /// @param shares                ERC4626 shares (Morpho) or aUSDC amount (Aave) to redeem.
+    /// @param shares                ERC4626 shares to redeem.
     /// @param feeVaults             Vault addresses from which to collect performance fee shares.
     /// @param feeAmounts            Corresponding share amounts to collect from each vault in `feeVaults`.
     /// @param destDomain            CCTP destination domain ID (e.g. 6 = Base, 0 = Ethereum).
@@ -601,8 +582,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///      Works for both single-vault (1-element arrays) and multi-vault relay+deposit.
     /// @param message     Raw CCTP V2 message bytes emitted from the source-chain burn event.
     /// @param attestation Circle attestation signature authorising the relay.
-    /// @param user        The user who will receive vault shares or aTokens.
-    /// @param vaults      Whitelisted destination vaults (may include `aavePool`).
+    /// @param user        The user who will receive vault shares.
+    /// @param vaults      Whitelisted ERC4626 destination vaults.
     /// @param amounts     USDC amounts to deposit into each vault, aligned 1:1 with `vaults`.
     ///                    Sum must be ≤ the USDC minted by the relay. Each entry must be > 0.
     function relayAndDeposit(
@@ -650,7 +631,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///      allowing users to initiate their own deposits and pay their own gas.
     ///      The user must have pre-approved this contract to spend at least
     ///      `sum(amounts) + sum(burns[i].amount)` USDC before calling.
-    ///      Works for both Morpho ERC4626 vaults and the Aave V3 Pool.
     ///      When `burns` is empty, behaves identically to a single-chain deposit.
     ///      When `burns` is non-empty, executes CCTP V2 `depositForBurn` for each entry,
     ///      burning USDC on the source chain so it can be minted on the destination chain.
@@ -711,13 +691,11 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///      the remainder to msg.sender as USDC.
     ///      `feeAmounts[i]` must be < `shares[i]`. Pass 0 for vaults with no fee.
     ///      Vaults where the effective amount resolves to zero are silently skipped.
-    ///      Aave path: `shares[i]` is treated as aUSDC amount. Fee shares for Aave are
-    ///      retained under the `aUsdc` token address (not `aavePool`).
     ///      When `burns` is non-empty, redeemed USDC is accumulated in the contract and
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
     ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
-    /// @param vaults     Vault addresses to withdraw from. Each must be whitelisted.
+    /// @param vaults     ERC4626 vault addresses to withdraw from. Each must be whitelisted.
     /// @param shares     Gross share amounts per vault (0 = full balance).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
     /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
@@ -749,35 +727,19 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
             address vault = vaults[i];
             if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
-            if (vault == aavePool) {
-                uint256 amt = shares[i] > 0 ? shares[i] : IERC20(aUsdc).balanceOf(msg.sender);
-                if (amt == 0) continue;
-                IERC20(aUsdc).safeTransferFrom(msg.sender, address(this), amt);
-                uint256 feeAmt = feeAmounts[i];
-                if (feeAmt > 0) {
-                    if (feeAmt >= amt) revert InvalidInput();
-                    amt -= feeAmt;
-                    feeVaultsEmitted[feeCount] = aUsdc;
-                    feeAmountsEmitted[feeCount] = feeAmt;
-                    feeCount++;
-                }
-                uint256 usdcReceived = IPool(aavePool).withdraw(address(usdc), amt, usdcRecipient);
-                emit StrategyExited(msg.sender, vault, amt, usdcReceived);
-            } else {
-                uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
-                if (amt == 0) continue;
-                IERC20(vault).safeTransferFrom(msg.sender, address(this), amt);
-                uint256 feeAmt = feeAmounts[i];
-                if (feeAmt > 0) {
-                    if (feeAmt >= amt) revert InvalidInput();
-                    amt -= feeAmt;
-                    feeVaultsEmitted[feeCount] = vault;
-                    feeAmountsEmitted[feeCount] = feeAmt;
-                    feeCount++;
-                }
-                uint256 usdcReceived = IERC4626(vault).redeem(amt, usdcRecipient, address(this));
-                emit StrategyExited(msg.sender, vault, amt, usdcReceived);
+            uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
+            if (amt == 0) continue;
+            IERC20(vault).safeTransferFrom(msg.sender, address(this), amt);
+            uint256 feeAmt = feeAmounts[i];
+            if (feeAmt > 0) {
+                if (feeAmt >= amt) revert InvalidInput();
+                amt -= feeAmt;
+                feeVaultsEmitted[feeCount] = vault;
+                feeAmountsEmitted[feeCount] = feeAmt;
+                feeCount++;
             }
+            uint256 usdcReceived = IERC4626(vault).redeem(amt, usdcRecipient, address(this));
+            emit StrategyExited(msg.sender, vault, amt, usdcReceived);
         }
 
         if (feeCount > 0) {
@@ -813,8 +775,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Sweep a specific amount of an ERC20 token to the owner.
-    /// @dev Use this to drain accumulated fee tokens (vault shares, aUSDC, or USDC
-    ///      bridge fees), or to recover accidentally sent tokens.
+    /// @dev Use this to drain accumulated fee tokens (vault shares or USDC bridge
+    ///      fees), or to recover accidentally sent tokens.
     /// @param token  The ERC20 token to sweep.
     /// @param amount The amount to transfer to the owner.
     function sweep(address token, uint256 amount) external onlyOwner nonReentrant {
@@ -828,7 +790,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Return the full list of currently whitelisted vault addresses.
-    /// @return Array of approved vault addresses (may include `aavePool`).
+    /// @return Array of approved vault addresses.
     function getApprovedVaults() external view returns (address[] memory) {
         return vaultList;
     }
