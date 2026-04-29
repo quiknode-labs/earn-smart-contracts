@@ -714,21 +714,21 @@ describe("QuicknodeEarn", function () {
       expect(usdcAfter > usdcBefore).to.be.true;
     });
 
-    it("should use full balance when shares[i] == 0", async function () {
-      const { usdc, vaultA, vaultB, user, rebalancerAsUser } =
+    it("should revert with ZeroAmount when shares[i] == 0 (L-06: sentinel removed)", async function () {
+      const { vaultA, vaultB, rebalancerAsUser } =
         await loadFixture(depositedMultiFixture);
 
-      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
-
-      await rebalancerAsUser.write.selfBatchWithdraw([
-        [vaultA.address, vaultB.address],
-        [0n, 0n],   // 0 = full balance
-        [0n, 0n],
-        [],  // no burns
-      ]);
-
-      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
-      expect(usdcAfter - usdcBefore).to.equal(parseUnits("800", 6));
+      // Per OZ audit L-06, the (shares[i] == 0 → full balance) sentinel was
+      // removed to close the max-approval footgun. Callers must pass an
+      // explicit gross share amount; a zero entry now reverts.
+      await expect(
+        rebalancerAsUser.write.selfBatchWithdraw([
+          [vaultA.address, vaultB.address],
+          [0n, 0n],
+          [0n, 0n],
+          [],
+        ])
+      ).to.be.rejectedWith("ZeroAmount");
     });
 
     it("should revert on non-whitelisted vault", async function () {

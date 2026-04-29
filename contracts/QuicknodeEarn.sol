@@ -438,7 +438,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     /// @dev Deposit USDC into an ERC4626 vault on behalf of `user`.
     function _depositToVault(address vault, uint256 amount, address user) internal returns (uint256 sharesReceived) {
         usdc.forceApprove(vault, amount);
-        return IERC4626(vault).deposit(amount, user);
+        sharesReceived = IERC4626(vault).deposit(amount, user);
+        if (sharesReceived == 0) revert ZeroAmount();
     }
 
     /// @dev Pull ERC4626 vault shares from `user` and redeem to USDC held by this contract.
@@ -501,6 +502,9 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         address[] calldata feeVaults,
         uint256[] calldata feeAmounts
     ) external onlyExecutor nonReentrant {
+        if (shares == 0) revert ZeroAmount();
+        if (fromVault == toVault) revert InvalidInput();
+        if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
         if (!approvedVaults[fromVault]) revert VaultNotApproved(fromVault);
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
 
@@ -562,6 +566,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         uint256 maxFee,
         uint32  minFinalityThreshold
     ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
+        if (shares == 0) revert ZeroAmount();
+        if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
         if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
         // Allowed pairings:
@@ -620,6 +626,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         uint256[] calldata amounts
     ) external onlyRelayer nonReentrant {
         if (vaults.length == 0) revert InvalidInput();
+        if (vaults.length != amounts.length) revert ArrayLengthMismatch();
 
         // Verify `user` matches the beneficiary committed in hookData at burn time.
         // CCTP V2 message layout: 148-byte header + 228-byte burn body = 376 bytes
@@ -786,8 +793,11 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
             address vault = vaults[i];
             if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
-            uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
-            if (amt == 0) continue;
+            // L-06: the (shares[i] == 0 → full balance) sentinel was removed; callers must
+            // pass the explicit gross share amount. This closes the max-approval footgun
+            // where a zero entry would silently drain the user's full balance from `vault`.
+            if (shares[i] == 0) revert ZeroAmount();
+            uint256 amt = shares[i];
             IERC20(vault).safeTransferFrom(msg.sender, address(this), amt);
             uint256 feeAmt = feeAmounts[i];
             if (feeAmt > 0) {
