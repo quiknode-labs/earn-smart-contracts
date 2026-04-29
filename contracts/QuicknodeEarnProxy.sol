@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -76,13 +76,13 @@ struct BridgeBurn {
 ///      - UUPS: only the owner may authorise an upgrade (`_authorizeUpgrade`).
 ///        The implementation's constructor calls `_disableInitializers()` to prevent
 ///        direct initialisation of the implementation contract itself.
-///      - All mutable state lives in ERC-7201 namespaced storage. Parents are also
-///        on ERC-7201 namespaced layouts: Ownable2StepUpgradeable directly, and the
-///        non-upgradeable ReentrancyGuard which was migrated to ERC-7201 in OZ v5.5
-///        (slot derived from "openzeppelin.storage.ReentrancyGuard"). No parent or
-///        child slot is sequential, so adds and reorders in any of them cannot
-///        shift another contract's slots.
-contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuard, UUPSUpgradeable {
+///      - All mutable state lives in ERC-7201 namespaced storage. Parents have no
+///        persistent storage that could collide: Ownable2StepUpgradeable is on an
+///        ERC-7201 namespaced layout, and ReentrancyGuardTransient uses transient
+///        storage (EIP-1153 TSTORE/TLOAD) so it has no persistent slots at all.
+///        No parent or child slot is sequential, so adds and reorders in any of them
+///        cannot shift another contract's slots.
+contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------

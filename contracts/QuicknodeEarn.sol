@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable2Step.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
@@ -70,7 +70,7 @@ struct BridgeBurn {
 ///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
 ///        with no owner requirement, providing a trustless exit path independent of
 ///        the rebalancer.
-contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
+contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
