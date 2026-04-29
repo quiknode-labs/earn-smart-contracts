@@ -16,14 +16,15 @@ interface IMessageTransmitter {
 
 /// @dev Minimal CCTP V2 TokenMessenger interface for cross-chain burns
 interface ITokenMessengerV2 {
-    function depositForBurn(
+    function depositForBurnWithHook(
         uint256 amount,
         uint32 destinationDomain,
         bytes32 mintRecipient,
         address burnToken,
         bytes32 destinationCaller,
         uint256 maxFee,
-        uint32 minFinalityThreshold
+        uint32 minFinalityThreshold,
+        bytes calldata hookData
     ) external returns (bytes32);
 }
 
@@ -277,11 +278,15 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Thrown when `feeVaults` and `feeAmounts` arrays have different lengths.
     error ArrayLengthMismatch();
 
-    /// @notice Thrown when the low-level call to the CCTP TokenMessenger's `depositForBurn` fails.
+    /// @notice Thrown when the low-level call to the CCTP TokenMessenger's `depositForBurnWithHook` fails.
     error CctpBurnFailed();
 
     /// @notice Thrown when the CCTP `receiveMessage` relay call returns false.
     error MessageRelayFailed();
+
+    /// @notice Thrown when `relayAndDeposit`'s `user` parameter does not match the
+    ///         beneficiary committed in the CCTP message's hookData at burn time.
+    error InvalidUser();
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -468,29 +473,31 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
     }
 
-    /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger (low-level call to avoid
-    ///      proxy return-value revert). Reverts if `tokenMessenger` is unset, `amount`
-    ///      is zero, `mintRecipient` is zero, or the burn call fails / returns no data.
+    /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger using `depositForBurnWithHook`.
+    ///      `beneficiary` is ABI-encoded as hookData and committed into the signed CCTP
+    ///      message, allowing `relayAndDeposit` on the destination chain to verify the
+    ///      intended vault-share recipient. Low-level call avoids proxy return-value revert.
     function _cctpBurn(
         uint256 amount,
         uint32  destDomain,
         bytes32 mintRecipient,
         bytes32 destinationCaller,
         uint256 maxFee,
-        uint32  minFinalityThreshold
+        uint32  minFinalityThreshold,
+        address beneficiary
     ) internal {
         if (tokenMessenger == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (mintRecipient == bytes32(0)) revert ZeroAddress();
         usdc.forceApprove(tokenMessenger, amount);
-        (bool success, bytes memory ret) = tokenMessenger.call(
-            abi.encodeWithSelector(
-                ITokenMessengerV2.depositForBurn.selector,
-                amount, destDomain, mintRecipient, address(usdc),
-                destinationCaller, maxFee, minFinalityThreshold
+        (bool success, ) = tokenMessenger.call(
+            abi.encodeCall(
+                ITokenMessengerV2.depositForBurnWithHook,
+                (amount, destDomain, mintRecipient, address(usdc),
+                 destinationCaller, maxFee, minFinalityThreshold, abi.encode(beneficiary))
             )
         );
-        if (!success || ret.length < 32) revert CctpBurnFailed();
+        if (!success) revert CctpBurnFailed();
     }
 
     // -------------------------------------------------------------------------
@@ -594,8 +601,8 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         // --- Withdrawal ---
         netUsdc = _withdrawFromVault(vault, user, shares);
 
-        // --- CCTP burn ---
-        _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold);
+        // --- CCTP burn (hookData = user, verified by relayAndDeposit on dest chain) ---
+        _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold, user);
 
         emit BridgeInitiated(user, vault, shares, netUsdc, destDomain);
     }
@@ -632,6 +639,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         uint256[] calldata amounts
     ) external onlyRelayer nonReentrant {
         if (vaults.length == 0) revert InvalidInput();
+
+        // Verify `user` matches the beneficiary committed in hookData at burn time.
+        // CCTP V2 message layout: 148-byte header + 228-byte burn body = 376 bytes
+        // before hookData; beneficiary is abi.encode(address) = 32 bytes.
+        if (message.length < 408) revert InvalidInput();
+        if (abi.decode(message[376:408], (address)) != user) revert InvalidUser();
 
         for (uint256 i = 0; i < vaults.length; i++) {
             if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
@@ -718,10 +731,11 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
             emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
         }
 
-        // Execute CCTP burns for cross-chain deposits
+        // Execute CCTP burns for cross-chain deposits (hookData = msg.sender)
         for (uint256 i = 0; i < burns.length; i++) {
             _cctpBurn(burns[i].amount, burns[i].destDomain,
-                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold);
+                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
+                msg.sender);
             emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
         }
 
@@ -809,7 +823,8 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
                 if (burnAmount > netUsdc) revert InvalidInput();
 
                 _cctpBurn(burnAmount, burns[i].destDomain,
-                    burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold);
+                    burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
+                    msg.sender);
                 emit BridgeBurnInitiated(msg.sender, burnAmount, burns[i].destDomain, burns[i].mintRecipient);
                 netUsdc -= burnAmount;
             }
