@@ -139,16 +139,6 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
     /// @notice The USDC token this contract operates on.
     IERC20  public immutable usdc;
 
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aavePool;
-
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aUsdc;
-
     /// @notice The CCTP V2 MessageTransmitter address for relaying bridge messages.
     ///         `address(0)` disables CCTP relay functionality (`relayAndDeposit` reverts).
     address public immutable messageTransmitter;
@@ -359,26 +349,19 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
     /// @dev Called once at deployment of the implementation. The proxy delegates all
     ///      calls (including `initialize`) to this contract, so this constructor only
     ///      runs against the implementation's own storage — not the proxy's.
-    ///      Pass `address(0)` for `_messageTransmitter` on chains where CCTP is not
-    ///      available. `_aavePool` and `_aUsdc` are preserved for ABI backwards
-    ///      compatibility — pass `address(0)` for both in new deployments.
+    ///      Pass `address(0)` for `_messageTransmitter` and `_tokenMessenger` on chains
+    ///      where CCTP is not available — relay/burn paths will revert with `ZeroAddress`.
     /// @param _usdc               USDC token address.
-    /// @param _aavePool           Deprecated (Aave removed). Pass `address(0)`.
-    /// @param _aUsdc              Deprecated (Aave removed). Pass `address(0)`.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
     /// @param _tokenMessenger     CCTP V2 TokenMessenger; `address(0)` disables CCTP burns.
     constructor(
         address _usdc,
-        address _aavePool,
-        address _aUsdc,
         address _messageTransmitter,
         address _tokenMessenger
     ) {
         if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
-        aavePool           = _aavePool;
-        aUsdc              = _aUsdc;
         messageTransmitter = _messageTransmitter;
         tokenMessenger     = _tokenMessenger;
 

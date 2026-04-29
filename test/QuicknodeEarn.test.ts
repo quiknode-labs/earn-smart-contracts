@@ -12,8 +12,6 @@ describe("QuicknodeEarn", function () {
    */
   async function deployBehindProxy(
     usdcAddr: `0x${string}`,
-    aavePool: `0x${string}`,
-    aUsdc: `0x${string}`,
     msgTransmitter: `0x${string}`,
     tokenMessenger: `0x${string}`,
     ownerAddr: `0x${string}`,
@@ -22,8 +20,6 @@ describe("QuicknodeEarn", function () {
     // 1. Deploy implementation (immutables set in constructor)
     const impl = await hre.viem.deployContract("QuicknodeEarnProxy", [
       usdcAddr,
-      aavePool,
-      aUsdc,
       msgTransmitter,
       tokenMessenger,
     ]);
@@ -69,12 +65,9 @@ describe("QuicknodeEarn", function () {
     ]);
 
     // Deploy QuicknodeEarn behind proxy
-    // aavePool/aUsdc set to zero (Aave integration removed)
-    // address(0) for messageTransmitter — CCTP not exercised in these tests
+    // address(0) for messageTransmitter / tokenMessenger — CCTP not exercised in these tests
     const rebalancer = await deployBehindProxy(
       usdc.address,
-      ZERO_ADDRESS as `0x${string}`, // aavePool (deprecated)
-      ZERO_ADDRESS as `0x${string}`, // aUsdc (deprecated)
       ZERO_ADDRESS as `0x${string}`, // messageTransmitter (disabled)
       ZERO_ADDRESS as `0x${string}`, // tokenMessenger (disabled)
       owner.account.address, // owner
@@ -115,16 +108,6 @@ describe("QuicknodeEarn", function () {
       );
     });
 
-    it("should set aavePool and aUsdc to zero (deprecated)", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      expect(getAddress(await rebalancer.read.aavePool())).to.equal(
-        getAddress(ZERO_ADDRESS)
-      );
-      expect(getAddress(await rebalancer.read.aUsdc())).to.equal(
-        getAddress(ZERO_ADDRESS)
-      );
-    });
-
     it("should set messageTransmitter to zero when disabled", async function () {
       const { rebalancer } = await loadFixture(deployFixture);
       expect(getAddress(await rebalancer.read.messageTransmitter())).to.equal(
@@ -138,20 +121,15 @@ describe("QuicknodeEarn", function () {
           ZERO_ADDRESS,
           ZERO_ADDRESS,
           ZERO_ADDRESS,
-          ZERO_ADDRESS,
-          ZERO_ADDRESS,
         ])
       ).to.be.rejectedWith("ZeroAddress");
     });
 
     it("should revert on zero owner in initialize", async function () {
-      const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       await expect(
         deployBehindProxy(
           usdc.address,
-          ZERO_ADDRESS as `0x${string}`,
-          ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
@@ -168,8 +146,6 @@ describe("QuicknodeEarn", function () {
         usdc.address,
         ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
         [vault.address],
       );
@@ -184,8 +160,6 @@ describe("QuicknodeEarn", function () {
       const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
       const rebalancer = await deployBehindProxy(
         usdc.address,
-        ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
@@ -974,8 +948,6 @@ describe("QuicknodeEarn", function () {
         usdc.address,
         ZERO_ADDRESS,
         ZERO_ADDRESS,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
       ]);
 
       // Upgrade
@@ -998,8 +970,6 @@ describe("QuicknodeEarn", function () {
         usdc.address,
         ZERO_ADDRESS,
         ZERO_ADDRESS,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
       ]);
 
       const rebalancerAsOther = await hre.viem.getContractAt(
@@ -1017,8 +987,6 @@ describe("QuicknodeEarn", function () {
 
       const impl = await hre.viem.deployContract("QuicknodeEarnProxy", [
         usdc.address,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
         ZERO_ADDRESS,
         ZERO_ADDRESS,
       ]);
@@ -1048,8 +1016,6 @@ describe("QuicknodeEarn", function () {
         usdc.address,
         ZERO_ADDRESS,
         ZERO_ADDRESS,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
       ]);
       await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
 
@@ -1071,8 +1037,6 @@ describe("QuicknodeEarn", function () {
 
       const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
         usdc.address,
-        ZERO_ADDRESS,
-        ZERO_ADDRESS,
         ZERO_ADDRESS,
         ZERO_ADDRESS,
       ]);
@@ -1107,7 +1071,7 @@ describe("QuicknodeEarn", function () {
 
       // Upgrade
       const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
-        usdc.address, ZERO_ADDRESS, ZERO_ADDRESS, ZERO_ADDRESS, ZERO_ADDRESS,
+        usdc.address, ZERO_ADDRESS, ZERO_ADDRESS,
       ]);
       await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
 

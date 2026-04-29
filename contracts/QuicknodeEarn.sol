@@ -109,16 +109,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     /// @notice The USDC token this contract operates on.
     IERC20  public immutable usdc;
 
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aavePool;
-
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aUsdc;
-
     /// @notice The CCTP V2 MessageTransmitter address for relaying bridge messages.
     ///         `address(0)` disables CCTP relay functionality (`relayAndDeposit` reverts).
     address public immutable messageTransmitter;
@@ -342,12 +332,10 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
 
     /// @notice Deploy QuicknodeEarn.
     /// @dev Sets all immutable addresses and optionally seeds the vault whitelist.
-    ///      `_aavePool` and `_aUsdc` are preserved for ABI backwards compatibility —
-    ///      pass `address(0)` for both in new deployments. Only `_usdc` and `_owner`
-    ///      must be non-zero.
+    ///      Only `_usdc` and `_owner` must be non-zero. Pass `address(0)` for
+    ///      `_messageTransmitter` and `_tokenMessenger` on chains where CCTP is
+    ///      not available — relay/burn paths will revert with `ZeroAddress`.
     /// @param _usdc               USDC token address.
-    /// @param _aavePool           Deprecated (Aave removed). Pass `address(0)`.
-    /// @param _aUsdc              Deprecated (Aave removed). Pass `address(0)`.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
     /// @param _tokenMessenger     CCTP V2 TokenMessenger; `address(0)` disables CCTP burns.
     /// @param _owner              Initial owner. Receives all owner privileges.
@@ -355,8 +343,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///                            Duplicates and zero addresses are silently skipped.
     constructor(
         address _usdc,
-        address _aavePool,
-        address _aUsdc,
         address _messageTransmitter,
         address _tokenMessenger,
         address _owner,
@@ -365,8 +351,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
-        aavePool           = _aavePool;
-        aUsdc              = _aUsdc;
         messageTransmitter = _messageTransmitter;
         tokenMessenger     = _tokenMessenger;
 

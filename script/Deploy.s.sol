@@ -30,8 +30,6 @@ contract DeployQuicknodeEarn is Script {
     // Per-chain constructor args (immutables baked into bytecode)
     struct ChainConfig {
         address usdc;
-        address aavePool;        // deprecated (Aave removed) — always address(0)
-        address aUsdc;           // deprecated (Aave removed) — always address(0)
         address msgTransmitter;  // zero if CCTP not on chain
         address tokenMessenger;  // zero if CCTP not on chain
     }
@@ -40,56 +38,42 @@ contract DeployQuicknodeEarn is Script {
         if (chainId == 1) { // Ethereum
             return ChainConfig({
                 usdc:            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 10) { // Optimism
             return ChainConfig({
                 usdc:            0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 130) { // Unichain
             return ChainConfig({
                 usdc:            0x078D782b760474a361dDA0AF3839290b0EF57AD6,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 137) { // Polygon
             return ChainConfig({
                 usdc:            0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 143) { // Monad
             return ChainConfig({
                 usdc:            0x754704Bc059F8C67012fEd69BC8A327a5aafb603,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 8453) { // Base
             return ChainConfig({
                 usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 42161) { // Arbitrum
             return ChainConfig({
                 usdc:            0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
@@ -122,8 +106,6 @@ contract DeployQuicknodeEarn is Script {
             type(QuicknodeEarn).creationCode,
             abi.encode(
                 cfg.usdc,
-                cfg.aavePool,
-                cfg.aUsdc,
                 cfg.msgTransmitter,
                 cfg.tokenMessenger,
                 deployer,
@@ -174,8 +156,6 @@ contract DeployQuicknodeEarn is Script {
             type(QuicknodeEarn).creationCode,
             abi.encode(
                 cfg.usdc,
-                cfg.aavePool,
-                cfg.aUsdc,
                 cfg.msgTransmitter,
                 cfg.tokenMessenger,
                 deployer,
@@ -222,8 +202,6 @@ contract DeployQuicknodeEarn is Script {
         // Step 1: Deploy implementation (regular CREATE — address doesn't matter)
         QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );
@@ -280,8 +258,6 @@ contract DeployQuicknodeEarn is Script {
 
         QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );
@@ -324,8 +300,6 @@ contract DeployQuicknodeEarn is Script {
         vm.startBroadcast(deployerKey);
         impl = address(new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         ));
@@ -360,8 +334,6 @@ contract DeployQuicknodeEarn is Script {
         // Step 1: Deploy new implementation with this chain's per-chain immutables.
         QuicknodeEarnProxy newImpl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );

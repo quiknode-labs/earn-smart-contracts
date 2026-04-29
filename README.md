@@ -40,8 +40,6 @@ Each Morpho market is an independent ERC4626 vault with its own address. The con
 
 Whitelisted vaults are stored in `vaultList`. Only addresses in this list may receive deposits. The owner maintains the whitelist via `addVault` / `batchAddVaults` / `removeVault`.
 
-> **Note:** The constructor still accepts `aavePool` and `aUsdc` parameters for backwards compatibility, but these are set to `address(0)` on all chains. Aave-specific logic is no longer used.
-
 ---
 
 ## Cross-Chain (CCTP V2)
@@ -126,8 +124,6 @@ Both pairings rely on **CREATE3 address parity**: the contract is deployed at th
 | Function | Description |
 | --- | --- |
 | `usdc()` | USDC token address (immutable) |
-| `aavePool()` | Legacy constructor param (immutable, always `address(0)`) |
-| `aUsdc()` | Legacy constructor param (immutable, always `address(0)`) |
 | `messageTransmitter()` | CCTP V2 MessageTransmitter address (immutable) |
 | `tokenMessenger()` | CCTP V2 TokenMessenger address (immutable, `address(0)` if disabled) |
 | `executor()` | Current executor address |
@@ -211,8 +207,6 @@ The contract is deployed directly (not behind a proxy). All immutables and initi
 ```solidity
 constructor(
     address _usdc,
-    address _aavePool,
-    address _aUsdc,
     address _messageTransmitter,
     address _tokenMessenger,
     address _owner,
@@ -223,8 +217,6 @@ constructor(
 | Parameter | Required | Description |
 | --- | --- | --- |
 | `_usdc` | Yes | USDC token address. Reverts on `address(0)`. |
-| `_aavePool` | No | Legacy param, always set to `address(0)`. |
-| `_aUsdc` | No | Legacy param, always set to `address(0)`. |
 | `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
 | `_tokenMessenger` | No | CCTP V2 TokenMessenger. `address(0)` disables CCTP burns. |
 | `_owner` | Yes | Initial owner (multisig). Reverts on `address(0)`. |

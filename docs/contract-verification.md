@@ -37,20 +37,15 @@ source .env
 VAULTS="[0x78999cc96d2Ba0341588C60CcB0E91c6C33CF371,...]"
 
 ARGS=$(cast abi-encode \
-  "constructor(address,address,address,address,address,address[],uint16,address)" \
+  "constructor(address,address,address,address,address[])" \
   0x754704Bc059F8C67012fEd69BC8A327a5aafb603 `# usdc` \
-  0x0000000000000000000000000000000000000000 `# aavePool (unused, set to zero)` \
-  0x0000000000000000000000000000000000000000 `# aUsdc (unused, set to zero)` \
   0x81D40F21F12A8F0E3252Bccb954D722d4c464B64 `# messageTransmitter` \
+  0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d `# tokenMessenger` \
   0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9 `# owner` \
-  "$VAULTS" \
-  50 `# maxFeeBps` \
-  0xd5d6a442890DbC4280EEb7EE92e70f3AD10De1b9) `# feeRecipient`
+  "$VAULTS")
 
 ARGS_RAW="${ARGS#0x}"   # strip 0x prefix
 ```
-
-> **Note:** The `aavePool` and `aUsdc` constructor params still exist in the contract but are set to `address(0)` on all chains.
 
 > **Tip:** Get the exact vault list from the deployed contract:
 >
