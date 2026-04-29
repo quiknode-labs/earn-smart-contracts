@@ -505,7 +505,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         if (shares == 0) revert ZeroAmount();
         if (fromVault == toVault) revert InvalidInput();
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
-        if (!approvedVaults[fromVault]) revert VaultNotApproved(fromVault);
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
@@ -568,7 +567,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
         if (shares == 0) revert ZeroAmount();
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
         // Allowed pairings:
         //   (this, this)  — MEV-protected cross-chain rebalance; the relayer
@@ -791,7 +789,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
 
         for (uint256 i = 0; i < vaults.length; i++) {
             address vault = vaults[i];
-            if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
             // L-06: the (shares[i] == 0 → full balance) sentinel was removed; callers must
             // pass the explicit gross share amount. This closes the max-approval footgun
