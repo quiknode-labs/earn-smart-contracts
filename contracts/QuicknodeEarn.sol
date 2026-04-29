@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.28;
 
-import "@openzeppelin/contracts/access/Ownable2Step.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 /// @dev Minimal Circle CCTP V2 MessageTransmitter interface.
 ///      Used by `relayAndDeposit` to finalize a cross-chain transfer: the relayer
@@ -128,7 +129,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     address public immutable tokenMessenger;
 
     /// @notice Maps vault address → whether it is whitelisted for deposits.
-    mapping(address => bool) public approvedVaults;
+    mapping(address vault => bool approved) public approvedVaults;
 
     /// @notice Enumerable list of all currently approved vault addresses.
     ///         Maintained in sync with `approvedVaults`.
@@ -462,7 +463,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         address user,
         address[] calldata feeVaults,
         uint256[] calldata feeAmounts
-    ) internal {
+    ) private {
         if (feeVaults.length == 0) return;
         for (uint256 i = 0; i < feeVaults.length; i++) {
             address fv = feeVaults[i];
@@ -474,14 +475,14 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @dev Deposit USDC into an ERC4626 vault on behalf of `user`.
-    function _depositToVault(address vault, uint256 amount, address user) internal returns (uint256 sharesReceived) {
+    function _depositToVault(address vault, uint256 amount, address user) private returns (uint256 sharesReceived) {
         usdc.forceApprove(vault, amount);
         sharesReceived = IERC4626(vault).deposit(amount, user);
         if (sharesReceived == 0) revert ZeroAmount();
     }
 
     /// @dev Pull ERC4626 vault shares from `user` and redeem to USDC held by this contract.
-    function _withdrawFromVault(address vault, address user, uint256 shares) internal returns (uint256 usdcReceived) {
+    function _withdrawFromVault(address vault, address user, uint256 shares) private returns (uint256 usdcReceived) {
         IERC20(vault).safeTransferFrom(user, address(this), shares);
         usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
     }
@@ -498,7 +499,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         uint256 maxFee,
         uint32  minFinalityThreshold,
         address beneficiary
-    ) internal {
+    ) private {
         if (tokenMessenger == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (mintRecipient == bytes32(0)) revert ZeroAddress();
