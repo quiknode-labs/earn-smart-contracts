@@ -516,7 +516,8 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
         if (tokenMessenger == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (mintRecipient == bytes32(0)) revert ZeroAddress();
-        usdc.forceApprove(tokenMessenger, amount);
+        // Approval is now hoisted to each call site (selfBatchDeposit, selfBatchWithdraw,
+        // withdrawAndBridge) so a batch of burns issues a single forceApprove instead of N.
         (bool success, ) = tokenMessenger.call(
             abi.encodeCall(
                 ITokenMessengerV2.depositForBurnWithHook,
@@ -640,6 +641,7 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
         netUsdc = _withdrawFromVault(vault, user, shares);
 
         // --- CCTP burn (hookData = user, verified by relayAndDeposit on dest chain) ---
+        usdc.forceApprove(tokenMessenger, netUsdc);
         _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold, user);
 
         emit BridgeInitiated(user, vault, shares, netUsdc, destDomain);
@@ -749,17 +751,18 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
 
         // Validate all vaults and compute total USDC needed
         EarnStorage storage $ = _getEarnStorage();
-        uint256 total = 0;
+        uint256 localTotal = 0;
         for (uint256 i = 0; i < vaults.length; i++) {
             if (!$.approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
             if (amounts[i] == 0) revert ZeroAmount();
-            total += amounts[i];
+            localTotal += amounts[i];
         }
         // Per-burn allowed pairings:
         //   (this, this)       — MEV-protected vault deposit on dest chain via relayAndDeposit.
         //   (msg.sender, 0)    — permissionless mint back to caller's wallet on dest chain.
         bytes32 selfB = bytes32(uint256(uint160(address(this))));
         bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
+        uint256 burnTotal = 0;
         for (uint256 i = 0; i < burns.length; i++) {
             if (burns[i].amount == 0) revert ZeroAmount();
             bytes32 mr = burns[i].mintRecipient;
@@ -767,12 +770,12 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
             bool isVaultDeposit = (mr == selfB && dc == selfB);
             bool isDirectMint   = (mr == senderB && dc == bytes32(0));
             if (!isVaultDeposit && !isDirectMint) revert InvalidInput();
-            total += burns[i].amount;
+            burnTotal += burns[i].amount;
         }
 
         // Pull total USDC from msg.sender in one transfer
         uint256 before = usdc.balanceOf(address(this));
-        usdc.safeTransferFrom(msg.sender, address(this), total);
+        usdc.safeTransferFrom(msg.sender, address(this), localTotal + burnTotal);
 
         // Deposit into each local vault
         for (uint256 i = 0; i < vaults.length; i++) {
@@ -780,7 +783,9 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
             emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
         }
 
-        // Execute CCTP burns for cross-chain deposits (hookData = msg.sender)
+        // Execute CCTP burns for cross-chain deposits (hookData = msg.sender).
+        // Single approval before the loop covers all burns in this batch.
+        if (burns.length > 0) usdc.forceApprove(tokenMessenger, burnTotal);
         for (uint256 i = 0; i < burns.length; i++) {
             _cctpBurn(burns[i].amount, burns[i].destDomain,
                 burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
@@ -794,7 +799,7 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
             usdc.safeTransfer(msg.sender, remainder);
         }
 
-        emit StrategyCreated(msg.sender, total);
+        emit StrategyCreated(msg.sender, localTotal + burnTotal);
     }
 
     // -------------------------------------------------------------------------
@@ -874,6 +879,7 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
         // Execute CCTP burns for cross-chain bridge-back
         if (hasBurns) {
             uint256 netUsdc = usdc.balanceOf(address(this)) - preBalance;
+            usdc.forceApprove(tokenMessenger, netUsdc);
 
             for (uint256 i = 0; i < burns.length; i++) {
                 uint256 burnAmount = burns[i].amount == type(uint256).max ? netUsdc : burns[i].amount;
@@ -885,6 +891,8 @@ contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient
                 emit BridgeBurnInitiated(msg.sender, burnAmount, burns[i].destDomain, burns[i].mintRecipient);
                 netUsdc -= burnAmount;
             }
+
+            usdc.forceApprove(tokenMessenger, 0);
 
             // Send any remainder to the user
             if (netUsdc > 0) {
