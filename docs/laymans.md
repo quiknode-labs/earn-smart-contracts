@@ -36,10 +36,10 @@ There are three distinct roles, each with hard boundaries on what they can do:
 - `withdrawAndBridge(...)` — same as rebalance but instead of depositing into another vault, burns the USDC via Circle's CCTP to bridge it to another chain.
 
 **Cannot do:**
-- Move funds to an arbitrary address — `rebalance` always deposits into `toVault` **on behalf of the user** (shares go to the user's wallet). `withdrawAndBridge` burns USDC via CCTP to a recipient specified in the call (set by our off-chain system to be our contract on the destination chain).
-- Operate on non-whitelisted vaults — both fromVault and toVault must be on the approved list
-- Rebalance from a vault to itself — explicitly blocked
-- Operate without the user's prior ERC20 approval — the contract uses `safeTransferFrom`, which requires the user to have approved spending
+- Move funds to an arbitrary address — `rebalance` always deposits into `toVault` **on behalf of the user** (shares go to the user's wallet). `withdrawAndBridge` accepts only two pairings on-chain: `(mintRecipient = address(this), destinationCaller = address(this))` for the MEV-protected cross-chain rebalance flow, or `(mintRecipient = user, destinationCaller = 0)` for a permissionless cross-chain exit straight to the user's wallet. Anything else reverts.
+- Deposit into non-whitelisted vaults — the destination vault (`toVault`) must be on the approved list. Source-side vaults are not checked, so positions can always be exited even if the vault is later delisted.
+- Rebalance from a vault to itself — explicitly blocked (`fromVault != toVault`)
+- Operate without the user's prior ERC20 approval — the withdraw leg uses `safeTransferFrom` (requires the user to have approved the source vault's share token), and the deposit leg requires the user to have approved the destination vault's share token. Both legs are gated by user consent.
 
 **Risk if compromised:** Could rebalance user funds into a low-yield vault (griefing, not stealing). Could claim excessive fee shares from users (the fee amounts are passed as parameters by the executor, not computed on-chain). Cannot steal principal because all deposit paths route shares back to the user's wallet.
 
@@ -144,5 +144,4 @@ The contract uses **low-level calls** to the TokenMessenger (not typed interface
 1. **Compromised owner key** — the owner can reassign the executor without delay and (in the proxy variant) upgrade the implementation. Either path can drain any user with active approvals. See the Owner section above for details. A timelocked multisig is the primary mitigation.
 2. **Malicious vault on the whitelist** — if the owner adds a vault that behaves unexpectedly (e.g., steals deposits), the contract has no defense. Vault vetting is an off-chain responsibility.
 3. **Executor claiming excessive fees** — fee amounts are passed as parameters, not computed on-chain. A compromised executor could pass inflated fee amounts.
-4. **`shares[i] == 0` over-withdrawal** — when a user passes 0, the contract uses their full on-chain balance. If a user has multiple strategies in the same vault, this withdraws everything. Our off-chain system always passes explicit amounts.
-5. **USDC itself** — the contract assumes USDC is a standard ERC20 with no fee-on-transfer or rebasing behavior.
+4. **USDC itself** — the contract assumes USDC is a standard ERC20 with no fee-on-transfer or rebasing behavior.
