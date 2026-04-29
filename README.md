@@ -12,7 +12,7 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
   - **Executor**: rebalancing and cross-chain withdraw+bridge operations (`onlyExecutor`)
   - **Relayer**: CCTP relay+deposit operations (`onlyRelayer`)
 
-  No role can withdraw funds to an arbitrary address — all paths route back to the user or an approved vault.
+  The executor and relayer can only route funds to the user or to approved vaults. However, the owner can reassign these roles without delay via `setExecutor`/`setRelayer`, and (in the proxy variant) can upgrade the implementation via `upgradeToAndCall`. A compromised owner key can therefore drain any user with active approvals. A timelocked multisig is strongly recommended as the owner.
 - **User-callable functions:** Users can create strategies via `selfBatchDeposit` and close them via `selfBatchWithdraw` without owner involvement, providing a trustless exit path independent of the rebalancer service.
 - **Fee model:** Performance fees are collected as vault shares (not USDC). The executor computes 15% of yield, converts to shares, and passes them as `feeVaults[]`/`feeAmounts[]`. The contract transfers those shares from the user to itself. The owner sweeps accumulated fee tokens via `sweep(token, amount)`.
 
@@ -28,7 +28,7 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 4. Users can exit independently via `selfBatchWithdraw()` — no owner approval needed.
 5. At no point does the contract accumulate user positions — all shares land in the user's wallet.
 
-Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). No role can withdraw funds to an arbitrary address — all functions route funds back to the user or to an approved vault.
+Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). The executor and relayer can only route funds to the user or to approved vaults. The owner, however, can reassign these roles without delay and (in the proxy variant) upgrade the implementation — meaning a compromised owner can transitively drain any user with active approvals. Deploying the owner behind a timelocked multisig mitigates this by giving users time to revoke approvals.
 
 ---
 
@@ -310,7 +310,7 @@ The primary audit targets are `contracts/QuicknodeEarn.sol` (~846 lines) and `co
 
 ### Trust Model Assumptions
 
-1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, and assigns roles. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults.
+1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, and assigns roles. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults. **A compromised owner is the highest-severity scenario:** the owner can install an attacker-controlled executor via `setExecutor` (no timelock), then abuse `_collectFees` with unbounded `feeAmounts[]` to transfer a user's entire vault-share balance to the contract, and finally `sweep` those shares. In the proxy variant, a single `upgradeToAndCall` can replace the implementation entirely. A timelocked multisig as owner is strongly recommended to give users time to revoke approvals.
 2. **Whitelisted vaults are legitimate ERC4626 contracts.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
 3. **Circle's CCTP contracts are trusted.** The `relayAndDeposit` and `withdrawAndBridge` functions interact with Circle-deployed contracts without additional validation.
 4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour.

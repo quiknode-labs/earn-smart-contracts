@@ -21,11 +21,11 @@ There are three distinct roles, each with hard boundaries on what they can do:
 - Assign or revoke the executor and relayer roles (`setExecutor`, `setRelayer`)
 - Sweep any token sitting in the contract to themselves (`sweep`) — this is intended for accumulated fee shares
 
-**Cannot do:**
-- Touch user funds directly — there is no function that lets the owner move a user's vault shares or USDC
-- Add a malicious vault and deposit user funds into it — only the executor can trigger deposits, and only the user can trigger their own deposits
+**Risk if compromised:** A compromised owner is the highest-severity scenario. Two drain paths exist:
+1. **Two-step drain via `setExecutor`:** The owner installs an attacker-controlled address as the executor (no timelock). The attacker-executor then calls `rebalance` or `withdrawAndBridge` with inflated `feeAmounts[]` (which have no on-chain upper bound), transferring a user's entire vault-share balance to the contract as "fees." The owner then calls `sweep` to extract those shares.
+2. **One-step drain via proxy upgrade (QuicknodeEarnProxy only):** A single `upgradeToAndCall` transaction replaces the implementation with one that performs unrestricted `transferFrom` calls against every address with a live approval.
 
-**Risk if compromised:** Could whitelist a malicious vault address. However, the owner alone can't force user funds into it — that requires either the executor (for rebalances) or the user themselves (for deposits). Could also sweep any tokens sitting *inside the contract* (accumulated fees, or USDC in transit during an atomic operation — but those are transient, lasting only a single transaction).
+**Mitigation:** Deploy the owner behind a timelocked multisig. A sufficient delay gives users time to monitor for suspicious role changes or upgrades and revoke their approvals before the action executes.
 
 ### 2. Executor (EOA, set by owner)
 
@@ -141,7 +141,8 @@ The contract uses **low-level calls** to the TokenMessenger (not typed interface
 
 ## What the contract does NOT protect against
 
-1. **Malicious vault on the whitelist** — if the owner adds a vault that behaves unexpectedly (e.g., steals deposits), the contract has no defense. Vault vetting is an off-chain responsibility.
-2. **Executor claiming excessive fees** — fee amounts are passed as parameters, not computed on-chain. A compromised executor could pass inflated fee amounts.
-3. **`shares[i] == 0` over-withdrawal** — when a user passes 0, the contract uses their full on-chain balance. If a user has multiple strategies in the same vault, this withdraws everything. Our off-chain system always passes explicit amounts.
-4. **USDC itself** — the contract assumes USDC is a standard ERC20 with no fee-on-transfer or rebasing behavior.
+1. **Compromised owner key** — the owner can reassign the executor without delay and (in the proxy variant) upgrade the implementation. Either path can drain any user with active approvals. See the Owner section above for details. A timelocked multisig is the primary mitigation.
+2. **Malicious vault on the whitelist** — if the owner adds a vault that behaves unexpectedly (e.g., steals deposits), the contract has no defense. Vault vetting is an off-chain responsibility.
+3. **Executor claiming excessive fees** — fee amounts are passed as parameters, not computed on-chain. A compromised executor could pass inflated fee amounts.
+4. **`shares[i] == 0` over-withdrawal** — when a user passes 0, the contract uses their full on-chain balance. If a user has multiple strategies in the same vault, this withdraws everything. Our off-chain system always passes explicit amounts.
+5. **USDC itself** — the contract assumes USDC is a standard ERC20 with no fee-on-transfer or rebasing behavior.
