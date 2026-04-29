@@ -1,0 +1,6 @@
+    struct EarnStorage {
+        mapping(address => bool) approvedVaults;
+        address[] vaultList;
+        address executor;
+        address relayer;
+    }

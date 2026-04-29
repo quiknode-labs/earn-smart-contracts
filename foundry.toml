@@ -4,6 +4,7 @@ out = "out"
 libs = ["lib", "node_modules"]
 remappings = [
     "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
     "forge-std/=lib/forge-std/src/",
 ]
 solc = "0.8.28"

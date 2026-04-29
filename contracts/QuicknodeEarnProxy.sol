@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
 /// @dev Minimal CCTP V2 MessageTransmitter interface for relaying messages
 interface IMessageTransmitter {
@@ -64,7 +63,7 @@ struct BridgeBurn {
 ///        accrued yield in a single operation.
 ///      - Vault whitelist: only addresses in `approvedVaults` may receive deposits. This
 ///        prevents the owner from draining users into arbitrary contracts.
-///      - Two-step ownership (`Ownable2Step`) prevents accidental ownership transfer to
+///      - Two-step ownership (`Ownable2StepUpgradeable`) prevents accidental ownership transfer to
 ///        an uncontrolled address.
 ///      - CCTP V2 integration: `withdrawAndBridge` burns USDC cross-chain after a
 ///        vault withdrawal; `relayAndDeposit` relays a CCTP message and atomically
@@ -77,11 +76,36 @@ struct BridgeBurn {
 ///      - UUPS: only the owner may authorise an upgrade (`_authorizeUpgrade`).
 ///        The implementation's constructor calls `_disableInitializers()` to prevent
 ///        direct initialisation of the implementation contract itself.
-contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
+///      - All mutable state lives in ERC-7201 namespaced storage. Parents are also
+///        on ERC-7201 namespaced layouts: Ownable2StepUpgradeable directly, and the
+///        non-upgradeable ReentrancyGuard which was migrated to ERC-7201 in OZ v5.5
+///        (slot derived from "openzeppelin.storage.ReentrancyGuard"). No parent or
+///        child slot is sequential, so adds and reorders in any of them cannot
+///        shift another contract's slots.
+contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuard, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
-    // State
+    // ERC-7201 namespaced storage
+    // -------------------------------------------------------------------------
+
+    /// @custom:storage-location erc7201:quicknode.earn.storage
+    struct EarnStorage {
+        mapping(address => bool) approvedVaults;
+        address[] vaultList;
+        address executor;
+        address relayer;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("quicknode.earn.storage")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant EARN_STORAGE_LOCATION = 0xa4cde844567bd426696e28bbfd17699530d36b5e6952a4ce0ac418703884c900;
+
+    function _getEarnStorage() private pure returns (EarnStorage storage $) {
+        assembly { $.slot := EARN_STORAGE_LOCATION }
+    }
+
+    // -------------------------------------------------------------------------
+    // Immutables (stored in implementation bytecode, not proxy storage)
     // -------------------------------------------------------------------------
 
     /// @notice The USDC token this contract operates on.
@@ -105,22 +129,6 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///         `address(0)` disables all CCTP burn paths (`withdrawAndBridge`, `selfBatchDeposit`
     ///         with burns, and `selfBatchWithdraw` with burns will revert).
     address public immutable tokenMessenger;
-
-    /// @notice Maps vault address → whether it is whitelisted for deposits.
-    mapping(address => bool) public approvedVaults;
-
-    /// @notice Enumerable list of all currently approved vault addresses.
-    ///         Maintained in sync with `approvedVaults`.
-    address[] public vaultList;
-
-
-    /// @notice The executor address permitted to call `rebalance` and `withdrawAndBridge`.
-    ///         Set by the owner via `setExecutor()`. May be an EOA or a contract.
-    address public executor;
-
-    /// @notice The relayer address permitted to call `relayAndDeposit`.
-    ///         Set by the owner via `setRelayer()`. May be an EOA or a contract.
-    address public relayer;
 
     // -------------------------------------------------------------------------
     // Events
@@ -304,13 +312,13 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
 
     /// @dev Restricts a function to the designated executor address.
     modifier onlyExecutor() {
-        if (msg.sender != executor) revert UnauthorizedExecutor();
+        if (msg.sender != _getEarnStorage().executor) revert UnauthorizedExecutor();
         _;
     }
 
     /// @dev Restricts a function to the designated relayer address.
     modifier onlyRelayer() {
-        if (msg.sender != relayer) revert UnauthorizedRelayer();
+        if (msg.sender != _getEarnStorage().relayer) revert UnauthorizedRelayer();
         _;
     }
 
@@ -337,7 +345,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         address _aUsdc,
         address _messageTransmitter,
         address _tokenMessenger
-    ) Ownable(msg.sender) {
+    ) {
         if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
@@ -358,13 +366,15 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     function initialize(address _owner, address[] calldata _initialVaults) external initializer {
         if (_owner == address(0)) revert ZeroAddress();
 
-        _transferOwnership(_owner);
+        __Ownable_init(_owner);
+        __Ownable2Step_init();
 
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < _initialVaults.length; i++) {
             address vault = _initialVaults[i];
-            if (vault != address(0) && !approvedVaults[vault]) {
-                approvedVaults[vault] = true;
-                vaultList.push(vault);
+            if (vault != address(0) && !$.approvedVaults[vault]) {
+                $.approvedVaults[vault] = true;
+                $.vaultList.push(vault);
                 emit VaultAdded(vault);
             }
         }
@@ -386,9 +396,10 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @param vault The vault address to whitelist. Must not be `address(0)`.
     function addVault(address vault) external onlyOwner {
         if (vault == address(0)) revert ZeroAddress();
-        if (!approvedVaults[vault]) {
-            approvedVaults[vault] = true;
-            vaultList.push(vault);
+        EarnStorage storage $ = _getEarnStorage();
+        if (!$.approvedVaults[vault]) {
+            $.approvedVaults[vault] = true;
+            $.vaultList.push(vault);
             emit VaultAdded(vault);
         }
     }
@@ -398,12 +409,13 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      Reverts if any element is `address(0)`.
     /// @param vaults Array of vault addresses to whitelist.
     function batchAddVaults(address[] calldata vaults) external onlyOwner {
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < vaults.length; i++) {
             address vault = vaults[i];
             if (vault == address(0)) revert ZeroAddress();
-            if (!approvedVaults[vault]) {
-                approvedVaults[vault] = true;
-                vaultList.push(vault);
+            if (!$.approvedVaults[vault]) {
+                $.approvedVaults[vault] = true;
+                $.vaultList.push(vault);
                 emit VaultAdded(vault);
             }
         }
@@ -414,15 +426,16 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      Reverts if `vault` is not currently approved.
     /// @param vault The vault address to de-list.
     function removeVault(address vault) external onlyOwner {
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
-        approvedVaults[vault] = false;
+        EarnStorage storage $ = _getEarnStorage();
+        if (!$.approvedVaults[vault]) revert VaultNotApproved(vault);
+        $.approvedVaults[vault] = false;
 
         // Remove from vaultList array (swap-and-pop, does not preserve order)
-        uint256 len = vaultList.length;
+        uint256 len = $.vaultList.length;
         for (uint256 i = 0; i < len; i++) {
-            if (vaultList[i] == vault) {
-                vaultList[i] = vaultList[len - 1];
-                vaultList.pop();
+            if ($.vaultList[i] == vault) {
+                $.vaultList[i] = $.vaultList[len - 1];
+                $.vaultList.pop();
                 break;
             }
         }
@@ -437,16 +450,18 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Set the executor address permitted to call `rebalance` and `withdrawAndBridge`.
     /// @param _executor The new executor address. Use `address(0)` to revoke.
     function setExecutor(address _executor) external onlyOwner {
-        address old = executor;
-        executor = _executor;
+        EarnStorage storage $ = _getEarnStorage();
+        address old = $.executor;
+        $.executor = _executor;
         emit ExecutorUpdated(old, _executor);
     }
 
     /// @notice Set the relayer address permitted to call `relayAndDeposit`.
     /// @param _relayer The new relayer address. Use `address(0)` to revoke.
     function setRelayer(address _relayer) external onlyOwner {
-        address old = relayer;
-        relayer = _relayer;
+        EarnStorage storage $ = _getEarnStorage();
+        address old = $.relayer;
+        $.relayer = _relayer;
         emit RelayerUpdated(old, _relayer);
     }
 
@@ -462,10 +477,11 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         uint256[] calldata feeAmounts
     ) internal {
         if (feeVaults.length == 0) return;
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < feeVaults.length; i++) {
             address fv = feeVaults[i];
             if (fv == address(0)) revert ZeroAddress();
-            if (!approvedVaults[fv]) revert VaultNotApproved(fv);
+            if (!$.approvedVaults[fv]) revert VaultNotApproved(fv);
             IERC20(fv).safeTransferFrom(user, address(this), feeAmounts[i]);
         }
         emit PerformanceFeeCollected(user, feeVaults, feeAmounts);
@@ -524,7 +540,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      The user must have pre-approved this contract to spend their `fromVault`
     ///      ERC4626 shares and any fee vault tokens before the rebalancer calls this.
     /// @param user       The user whose position is being rebalanced.
-    /// @param fromVault  The vault to withdraw from. Must be whitelisted.
+    /// @param fromVault  The vault to withdraw from.
     /// @param toVault    The vault to deposit into. Must be whitelisted.
     /// @param shares     ERC4626 shares to move.
     /// @param feeVaults  Vault addresses from which to collect performance fee shares.
@@ -541,7 +557,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         if (shares == 0) revert ZeroAmount();
         if (fromVault == toVault) revert InvalidInput();
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
-        if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
+        if (!_getEarnStorage().approvedVaults[toVault]) revert VaultNotApproved(toVault);
         if (IERC20(toVault).allowance(user, address(this)) == 0) revert InvalidInput();
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
@@ -579,7 +595,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      front-running the relay and stealing the minted USDC.
     ///      Performance fees are collected as vault shares before the withdrawal.
     /// @param user                  The user whose vault position is bridged.
-    /// @param vault                 The vault to withdraw from. Must be whitelisted.
+    /// @param vault                 The vault to withdraw from.
     /// @param shares                ERC4626 shares to redeem.
     /// @param feeVaults             Vault addresses from which to collect performance fee shares.
     /// @param feeAmounts            Corresponding share amounts to collect from each vault in `feeVaults`.
@@ -669,8 +685,9 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         if (message.length < 408) revert InvalidInput();
         if (abi.decode(message[376:408], (address)) != user) revert InvalidUser();
 
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < vaults.length; i++) {
-            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (!$.approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
             if (IERC20(vaults[i]).allowance(user, address(this)) == 0) revert InvalidInput();
         }
 
@@ -731,9 +748,10 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
 
         // Validate all vaults and compute total USDC needed
+        EarnStorage storage $ = _getEarnStorage();
         uint256 total = 0;
         for (uint256 i = 0; i < vaults.length; i++) {
-            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (!$.approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
             if (amounts[i] == 0) revert ZeroAmount();
             total += amounts[i];
         }
@@ -794,7 +812,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
     ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
-    /// @param vaults     ERC4626 vault addresses to withdraw from. Each must be whitelisted.
+    /// @param vaults     ERC4626 vault addresses to withdraw from.
     /// @param shares     Gross share amounts per vault (0 = full balance).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
     /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
@@ -930,13 +948,23 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Return the full list of currently whitelisted vault addresses.
     /// @return Array of approved vault addresses.
     function getApprovedVaults() external view returns (address[] memory) {
-        return vaultList;
+        return _getEarnStorage().vaultList;
     }
 
     /// @notice Check whether a specific vault address is currently whitelisted.
     /// @param vault The address to query.
     /// @return True if the vault is approved, false otherwise.
     function isVaultApproved(address vault) external view returns (bool) {
-        return approvedVaults[vault];
+        return _getEarnStorage().approvedVaults[vault];
+    }
+
+    /// @notice The executor address permitted to call `rebalance` and `withdrawAndBridge`.
+    function executor() external view returns (address) {
+        return _getEarnStorage().executor;
+    }
+
+    /// @notice The relayer address permitted to call `relayAndDeposit`.
+    function relayer() external view returns (address) {
+        return _getEarnStorage().relayer;
     }
 }
