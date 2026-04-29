@@ -550,6 +550,18 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
         if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
+        // Allowed pairings:
+        //   (this, this)  — MEV-protected cross-chain rebalance; the relayer
+        //                   completes the deposit via relayAndDeposit.
+        //   (user,   0)   — permissionless cross-chain exit; anyone can call
+        //                   receiveMessage on the destination chain to mint USDC
+        //                   directly to the user's wallet.
+        bytes32 selfB = bytes32(uint256(uint160(address(this))));
+        bytes32 userB = bytes32(uint256(uint160(user)));
+        bool isRebalance = (mintRecipient == selfB && destinationCaller == selfB);
+        bool isExit      = (mintRecipient == userB && destinationCaller == bytes32(0));
+        if (!isRebalance && !isExit) revert InvalidInput();
+
         // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
 
@@ -656,8 +668,18 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
             if (amounts[i] == 0) revert ZeroAmount();
             total += amounts[i];
         }
+        // Per-burn allowed pairings:
+        //   (this, this)       — MEV-protected vault deposit on dest chain via relayAndDeposit.
+        //   (msg.sender, 0)    — permissionless mint back to caller's wallet on dest chain.
+        bytes32 selfB = bytes32(uint256(uint160(address(this))));
+        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
         for (uint256 i = 0; i < burns.length; i++) {
             if (burns[i].amount == 0) revert ZeroAmount();
+            bytes32 mr = burns[i].mintRecipient;
+            bytes32 dc = burns[i].destinationCaller;
+            bool isVaultDeposit = (mr == selfB && dc == selfB);
+            bool isDirectMint   = (mr == senderB && dc == bytes32(0));
+            if (!isVaultDeposit && !isDirectMint) revert InvalidInput();
             total += burns[i].amount;
         }
 
@@ -708,9 +730,12 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ) external nonReentrant {
         if (vaults.length == 0 || shares.length != vaults.length) revert InvalidInput();
         if (feeAmounts.length != vaults.length) revert ArrayLengthMismatch();
-        // type(uint256).max sentinel ("burn all") is only valid in the final burn entry
-        for (uint256 i = 0; i + 1 < burns.length; i++) {
-            if (burns[i].amount == type(uint256).max) revert InvalidInput();
+        // Per-burn pairing: (msg.sender, 0) — permissionless bridge-back to the
+        // caller's wallet. type(uint256).max ("burn all") only valid in the final entry.
+        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
+        for (uint256 i = 0; i < burns.length; i++) {
+            if (i + 1 < burns.length && burns[i].amount == type(uint256).max) revert InvalidInput();
+            if (burns[i].mintRecipient != senderB || burns[i].destinationCaller != bytes32(0)) revert InvalidInput();
         }
 
         // When burns are present, USDC goes to the contract first (for CCTP burn).
