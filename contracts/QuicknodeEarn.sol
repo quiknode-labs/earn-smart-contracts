@@ -281,6 +281,16 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
     ///         beneficiary committed in the CCTP message's hookData at burn time.
     error InvalidUser();
 
+    /// @notice Thrown when `emergencyClaimBridge` is called by an address other than the
+    ///         hookData beneficiary committed at burn time.
+    error Unauthorized();
+
+    /// @notice Emitted when a user claims a bridged CCTP burn directly via
+    ///         `emergencyClaimBridge`, bypassing the relayer.
+    /// @param user   The hookData beneficiary who claimed the bridge.
+    /// @param amount USDC amount delivered to the beneficiary's wallet.
+    event BridgeClaimed(address indexed user, uint256 amount);
+
     // -------------------------------------------------------------------------
     // Modifiers
     // -------------------------------------------------------------------------
@@ -506,6 +516,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
         if (fromVault == toVault) revert InvalidInput();
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
+        if (IERC20(toVault).allowance(user, address(this)) == 0) revert InvalidInput();
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
@@ -634,6 +645,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
 
         for (uint256 i = 0; i < vaults.length; i++) {
             if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (IERC20(vaults[i]).allowance(user, address(this)) == 0) revert InvalidInput();
         }
 
         // Step 1: Snapshot USDC balance before relay
@@ -835,6 +847,39 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuard {
                 usdc.safeTransfer(msg.sender, netUsdc);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // User-callable: CCTP escape hatch
+    // -------------------------------------------------------------------------
+
+    /// @notice Consume a pending CCTP V2 message and deliver the minted USDC straight
+    ///         to the beneficiary's wallet, bypassing the vault deposit. Use when the
+    ///         relayer cannot complete `relayAndDeposit` (relayer down, beneficiary
+    ///         has no destination-vault allowance, etc.).
+    /// @dev Authorization is via the hookData beneficiary committed at burn time
+    ///      (encoded by `_cctpBurn`, validated by `relayAndDeposit`). Only callable by
+    ///      that beneficiary on the destination chain. Works because this contract is
+    ///      the `destinationCaller` per the L-02 pairing constraint for the
+    ///      `(this, this)` case.
+    /// @param message     Raw CCTP V2 message bytes from Circle's Iris API.
+    /// @param attestation Circle attestation signature authorising the relay.
+    function emergencyClaimBridge(
+        bytes calldata message,
+        bytes calldata attestation
+    ) external nonReentrant {
+        if (message.length < 408) revert InvalidInput();
+        address beneficiary = abi.decode(message[376:408], (address));
+        if (msg.sender != beneficiary) revert Unauthorized();
+
+        uint256 before = usdc.balanceOf(address(this));
+        bool ok = IMessageTransmitter(messageTransmitter).receiveMessage(message, attestation);
+        if (!ok) revert MessageRelayFailed();
+
+        uint256 minted = usdc.balanceOf(address(this)) - before;
+        usdc.safeTransfer(beneficiary, minted);
+
+        emit BridgeClaimed(beneficiary, minted);
     }
 
     // -------------------------------------------------------------------------
