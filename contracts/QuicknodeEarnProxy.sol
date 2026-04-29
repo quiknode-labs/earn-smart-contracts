@@ -534,10 +534,17 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         _collectFees(user, feeVaults, feeAmounts);
 
         // --- Withdrawal leg ---
+        uint256 before = usdc.balanceOf(address(this));
         uint256 usdcReceived = _withdrawFromVault(fromVault, user, shares);
 
         // --- Deposit leg (full amount — fees already taken as shares) ---
         _depositToVault(toVault, usdcReceived, user);
+
+        // --- Return any remainder to the user ---
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(user, remainder);
+        }
 
         emit Rebalanced(user, fromVault, toVault, shares, usdcReceived);
     }
@@ -670,6 +677,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
             uint256 sharesReceived = _depositToVault(vaults[i], amounts[i], user);
             emit DepositedFromBridge(user, vaults[i], amounts[i], sharesReceived);
         }
+
+        // Step 5: Return any remainder to the user (e.g. CCTP fee buffer)
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(user, remainder);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -723,6 +736,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         }
 
         // Pull total USDC from msg.sender in one transfer
+        uint256 before = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), total);
 
         // Deposit into each local vault
@@ -737,6 +751,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
                 burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
                 msg.sender);
             emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
+        }
+
+        // Return any remainder to the user
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(msg.sender, remainder);
         }
 
         emit StrategyCreated(msg.sender, total);
