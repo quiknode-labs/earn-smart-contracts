@@ -7,13 +7,41 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-/// @dev Minimal CCTP V2 MessageTransmitter interface for relaying messages
+/// @dev Minimal Circle CCTP V2 MessageTransmitter interface.
+///      Used by `relayAndDeposit` to finalize a cross-chain transfer: the relayer
+///      submits the original CCTP message + Circle attestation, which mints USDC
+///      on the destination chain.
 interface IMessageTransmitter {
+    /// @notice Verify `attestation` against Circle's attester set and execute the
+    ///         embedded mint. Returns true on success; reverts on invalid attestation
+    ///         or replayed nonce.
+    /// @param message     The raw CCTP message emitted on the source chain.
+    /// @param attestation Circle-signed attestation bytes (from the Iris API).
     function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool);
 }
 
-/// @dev Minimal CCTP V2 TokenMessenger interface for cross-chain burns
+/// @dev Minimal Circle CCTP V2 TokenMessenger interface for cross-chain burns.
+///      `depositForBurnWithHook` is called via low-level `call` in `_cctpBurn`
+///      rather than a typed interface call so it tolerates ABI variation across
+///      CCTP V2 proxy deployments — a typed void-return call would revert on any
+///      proxy that surfaces non-empty return data, while a typed bytes-returning
+///      call would revert on any proxy that returns nothing. The low-level call
+///      simply checks `success` and discards the return data.
 interface ITokenMessengerV2 {
+    /// @notice Burn `amount` of `burnToken` on the source chain and arrange a mint
+    ///         of the same amount (minus fees) to `mintRecipient` on `destinationDomain`.
+    ///         `hookData` is committed into the signed message and forwarded on the
+    ///         destination chain — this contract encodes the beneficiary address there
+    ///         so `relayAndDeposit` can verify the intended vault-share recipient.
+    /// @param amount               USDC amount to burn.
+    /// @param destinationDomain    CCTP domain ID of the target chain.
+    /// @param mintRecipient        bytes32-encoded address that will receive minted USDC.
+    /// @param burnToken            The token to burn (USDC).
+    /// @param destinationCaller    If non-zero, only this address may call `receiveMessage`.
+    /// @param maxFee               Maximum fee (in USDC) the relayer may deduct.
+    /// @param minFinalityThreshold Minimum source-chain finality before attestation.
+    /// @param hookData             Arbitrary bytes forwarded to the destination — we encode
+    ///                             the beneficiary address for on-chain verification.
     function depositForBurnWithHook(
         uint256 amount,
         uint32 destinationDomain,
@@ -23,7 +51,7 @@ interface ITokenMessengerV2 {
         uint256 maxFee,
         uint32 minFinalityThreshold,
         bytes calldata hookData
-    ) external returns (bytes32);
+    ) external;
 }
 
 /// @notice Parameters for a single CCTP V2 cross-chain burn within `selfBatchDeposit`
