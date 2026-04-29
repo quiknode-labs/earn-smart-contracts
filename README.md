@@ -1,12 +1,12 @@
 # earn-smart-contracts
 
-Non-custodial yield-optimiser contract that moves user funds between whitelisted Morpho (ERC4626) vaults and the Aave V3 Pool to maximise supply APY.
+Non-custodial yield-optimiser contract that moves user funds between whitelisted ERC4626 vaults (Morpho) to maximise supply APY.
 
 ---
 
 ## Overview
 
-- **Non-custodial:** Users grant ERC20 approvals to the contract but never transfer principal in. All vault shares and aTokens are held by the user's wallet.
+- **Non-custodial:** Users grant ERC20 approvals to the contract but never transfer principal in. All vault shares are held by the user's wallet.
 - **Three-role access control:** Privileged functions are split across three roles:
   - **Owner** (multisig): vault whitelist management, fee sweeps, role assignment
   - **Executor**: rebalancing and cross-chain withdraw+bridge operations (`onlyExecutor`)
@@ -22,11 +22,11 @@ Non-custodial yield-optimiser contract that moves user funds between whitelisted
 
 **Users retain custody at all times.** The flow is:
 
-1. User approves `QuicknodeEarn` to spend their USDC (and vault shares/aTokens for withdrawals).
-2. Users create positions via `selfBatchDeposit()` — USDC is pulled from the user and deposited into chosen vaults. Vault shares/aTokens are minted directly to the user.
+1. User approves `QuicknodeEarn` to spend their USDC (and vault shares for withdrawals).
+2. Users create positions via `selfBatchDeposit()` — USDC is pulled from the user and deposited into chosen vaults. Vault shares are minted directly to the user.
 3. For rebalancing, the executor calls `rebalance()` — shares are pulled from the user, redeemed for USDC, and re-deposited into the new vault on behalf of the user.
 4. Users can exit independently via `selfBatchWithdraw()` — no owner approval needed.
-5. At no point does the contract accumulate user positions — all shares/aTokens land in the user's wallet.
+5. At no point does the contract accumulate user positions — all shares land in the user's wallet.
 
 Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps, role assignment), `onlyExecutor` (rebalance, withdrawAndBridge), and `onlyRelayer` (relayAndDeposit). No role can withdraw funds to an arbitrary address — all functions route funds back to the user or to an approved vault.
 
@@ -34,17 +34,13 @@ Three modifiers gate privileged functions: `onlyOwner` (vault whitelist, sweeps,
 
 ## Supported Protocols
 
-### Morpho (ERC4626 Vaults)
+### ERC4626 Vaults (Morpho)
 
 Each Morpho market is an independent ERC4626 vault with its own address. The contract interacts via the standard `deposit(amount, receiver)` / `redeem(shares, receiver, owner)` interface.
 
 Whitelisted vaults are stored in `vaultList`. Only addresses in this list may receive deposits. The owner maintains the whitelist via `addVault` / `batchAddVaults` / `removeVault`.
 
-### Aave V3 Pool (aTokens)
-
-The Aave V3 Pool is a single contract per chain. Instead of ERC4626, it uses `supply(asset, amount, onBehalfOf, referralCode)` and `withdraw(asset, amount, to)`. The Pool returns rebasing aTokens (1:1 with USDC, accruing interest continuously).
-
-The contract detects the Aave path by comparing the vault address to the immutable `aavePool` address. When `vault == aavePool`, deposit/withdraw routes through `IPool` instead of `IERC4626`. On chains where Aave V3 is not deployed, `aavePool` is set to `address(0)`.
+> **Note:** The constructor still accepts `aavePool` and `aUsdc` parameters for backwards compatibility, but these are set to `address(0)` on all chains. Aave-specific logic is no longer used.
 
 ---
 
@@ -114,8 +110,8 @@ The `minFinalityThreshold` parameter in `BridgeBurn` controls how quickly Circle
 | Function | Description |
 | --- | --- |
 | `usdc()` | USDC token address (immutable) |
-| `aavePool()` | Aave V3 Pool address (immutable, `address(0)` if not on chain) |
-| `aUsdc()` | Aave aUSDC token address (immutable, `address(0)` if not on chain) |
+| `aavePool()` | Legacy constructor param (immutable, always `address(0)`) |
+| `aUsdc()` | Legacy constructor param (immutable, always `address(0)`) |
 | `messageTransmitter()` | CCTP V2 MessageTransmitter address (immutable) |
 | `tokenMessenger()` | CCTP V2 TokenMessenger address (immutable, `address(0)` if disabled) |
 | `executor()` | Current executor address |
@@ -211,8 +207,8 @@ constructor(
 | Parameter | Required | Description |
 | --- | --- | --- |
 | `_usdc` | Yes | USDC token address. Reverts on `address(0)`. |
-| `_aavePool` | No | Aave V3 Pool address. `address(0)` on chains without Aave. |
-| `_aUsdc` | No | Aave aUSDC token address. `address(0)` on chains without Aave. |
+| `_aavePool` | No | Legacy param, always set to `address(0)`. |
+| `_aUsdc` | No | Legacy param, always set to `address(0)`. |
 | `_messageTransmitter` | No | CCTP V2 MessageTransmitter. `address(0)` disables relay. |
 | `_tokenMessenger` | No | CCTP V2 TokenMessenger. `address(0)` disables CCTP burns. |
 | `_owner` | Yes | Initial owner (multisig). Reverts on `address(0)`. |
@@ -315,15 +311,15 @@ The primary audit targets are `contracts/QuicknodeEarn.sol` (~846 lines) and `co
 ### Trust Model Assumptions
 
 1. **Owner is a trusted multisig; executor and relayer are trusted EOAs.** The owner manages the vault whitelist, sweeps fees, and assigns roles. The executor can rebalance and bridge on behalf of users who have granted approval. The relayer can relay CCTP attestations and deposit into vaults. A compromised executor cannot steal funds (all paths route back to the user or approved vaults), but can grief users by rebalancing into low-yield vaults or collecting excessive fee shares. A compromised relayer can only deposit bridged USDC into whitelisted vaults.
-2. **Whitelisted vaults are legitimate ERC4626 contracts or the genuine Aave V3 Pool.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
+2. **Whitelisted vaults are legitimate ERC4626 contracts.** A malicious vault in the whitelist could cause `deposit` or `rebalance` to misbehave. The vault whitelist is the primary trust boundary.
 3. **Circle's CCTP contracts are trusted.** The `relayAndDeposit` and `withdrawAndBridge` functions interact with Circle-deployed contracts without additional validation.
-4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour beyond what Aave's aUSDC provides.
+4. **USDC is a standard ERC20.** The contract uses `SafeERC20` but assumes USDC does not have fee-on-transfer or rebasing behaviour.
 
 ### Known Constraints
 
 1. `selfBatchWithdraw` with `shares[i] == 0` reads the user's full on-chain balance. If the user has multiple strategies in the same vault, this will over-withdraw. The off-chain rebalancer always passes explicit share amounts to avoid this.
 2. `withdrawAndBridge` uses a low-level call to the CCTP TokenMessenger to avoid proxy return-value decoding issues. The `CctpBurnFailed` error is thrown if the call reverts.
-3. `_collectFees` only supports ERC4626 (Morpho) vault shares. Aave fee collection is handled inline within `selfBatchWithdraw`, where fee shares are keyed by `aUsdc` (not `aavePool`) since the actual token transferred is aUSDC.
+3. `_collectFees` supports ERC4626 vault shares only.
 
 ---
 

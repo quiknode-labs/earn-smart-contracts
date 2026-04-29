@@ -30,8 +30,8 @@ contract DeployQuicknodeEarn is Script {
     // Per-chain constructor args (immutables baked into bytecode)
     struct ChainConfig {
         address usdc;
-        address aavePool;        // zero if Aave not on chain
-        address aUsdc;           // zero if Aave not on chain
+        address aavePool;        // deprecated (Aave removed) — always address(0)
+        address aUsdc;           // deprecated (Aave removed) — always address(0)
         address msgTransmitter;  // zero if CCTP not on chain
         address tokenMessenger;  // zero if CCTP not on chain
     }
@@ -40,20 +40,20 @@ contract DeployQuicknodeEarn is Script {
         if (chainId == 1) { // Ethereum
             return ChainConfig({
                 usdc:            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
-                aavePool:        0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2,
-                aUsdc:           0x98C23E9d8f34FEFb1B7BD6a91B7FF122F4e16F5c,
+                aavePool:        address(0),
+                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
-        } else if (chainId == 10) { // Optimism (native USDC + USDCn aToken)
+        } else if (chainId == 10) { // Optimism
             return ChainConfig({
                 usdc:            0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85,
-                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
-                aUsdc:           0x38d693cE1dF5AaDF7bC62595A37D667aD57922e5,
+                aavePool:        address(0),
+                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
-        } else if (chainId == 130) { // Unichain — Morpho only
+        } else if (chainId == 130) { // Unichain
             return ChainConfig({
                 usdc:            0x078D782b760474a361dDA0AF3839290b0EF57AD6,
                 aavePool:        address(0),
@@ -61,11 +61,11 @@ contract DeployQuicknodeEarn is Script {
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
-        } else if (chainId == 137) { // Polygon (native USDC + USDCn aToken)
+        } else if (chainId == 137) { // Polygon
             return ChainConfig({
                 usdc:            0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359,
-                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
-                aUsdc:           0xA4D94019934D8333Ef880ABFFbF2FDd611C762BD,
+                aavePool:        address(0),
+                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
@@ -80,16 +80,16 @@ contract DeployQuicknodeEarn is Script {
         } else if (chainId == 8453) { // Base
             return ChainConfig({
                 usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
-                aavePool:        0xA238Dd80C259a72e81d7e4664a9801593F98d1c5,
-                aUsdc:           0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB,
+                aavePool:        address(0),
+                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 42161) { // Arbitrum
             return ChainConfig({
                 usdc:            0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
-                aavePool:        0x794a61358D6845594F94dc1DB02A252b5b4814aD,
-                aUsdc:           0x724dc807b04555b71ed48a6896b6F41593b8C637,
+                aavePool:        address(0),
+                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
@@ -333,8 +333,6 @@ contract DeployQuicknodeEarn is Script {
 
         console.log("New impl:    ", impl);
         console.log("USDC:        ", cfg.usdc);
-        console.log("aavePool:    ", cfg.aavePool);
-        console.log("aUsdc:       ", cfg.aUsdc);
         console.log("Next step:   owner calls upgradeToAndCall(newImpl, \"\") on the proxy");
     }
 
@@ -381,6 +379,5 @@ contract DeployQuicknodeEarn is Script {
         console.log("Relayer (kept):  ", rebalancer.relayer());
         console.log("Vaults (kept):   ", rebalancer.getApprovedVaults().length);
         console.log("USDC:            ", address(rebalancer.usdc()));
-        console.log("aUsdc:           ", rebalancer.aUsdc());
     }
 }

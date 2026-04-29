@@ -2,9 +2,9 @@
 
 ## What does this contract do?
 
-The contract is a **routing layer** for USDC. It doesn't hold user funds long-term — it acts as a middleman that moves a user's USDC into and out of yield-bearing vaults (Morpho and Aave). Think of it like a concierge: the user says "put my money here," and the contract does the paperwork.
+The contract is a **routing layer** for USDC. It doesn't hold user funds long-term — it acts as a middleman that moves a user's USDC into and out of yield-bearing ERC4626 vaults (Morpho). Think of it like a concierge: the user says "put my money here," and the contract does the paperwork.
 
-The user's money is always sitting in external vaults (Morpho or Aave) in the form of vault shares or aTokens, **in the user's own wallet**. The contract itself holds zero user principal at rest.
+The user's money is always sitting in external vaults (Morpho ERC4626) in the form of vault shares, **in the user's own wallet**. The contract itself holds zero user principal at rest.
 
 ---
 
@@ -41,7 +41,7 @@ There are three distinct roles, each with hard boundaries on what they can do:
 - Rebalance from a vault to itself — explicitly blocked
 - Operate without the user's prior ERC20 approval — the contract uses `safeTransferFrom`, which requires the user to have approved spending
 
-**Risk if compromised:** Could rebalance user funds into a low-yield vault (griefing, not stealing). Could claim excessive fee shares from users (the fee amounts are passed as parameters by the executor, not computed on-chain). Cannot steal principal because all deposit paths route shares/aTokens back to the user's wallet.
+**Risk if compromised:** Could rebalance user funds into a low-yield vault (griefing, not stealing). Could claim excessive fee shares from users (the fee amounts are passed as parameters by the executor, not computed on-chain). Cannot steal principal because all deposit paths route shares back to the user's wallet.
 
 ### 3. Relayer (EOA, set by owner)
 
@@ -68,7 +68,7 @@ Users have two self-service functions that work without any privileged role:
 - User deposits their USDC into one or more whitelisted vaults in a single transaction
 - Optionally burns some USDC via CCTP to bridge it to another chain
 - The contract pulls total USDC from the user in one transfer, then distributes
-- Vault shares/aTokens are minted directly to the user's wallet
+- Vault shares are minted directly to the user's wallet
 - **Requires:** user has pre-approved the contract to spend their USDC
 
 ### `selfBatchWithdraw(vaults[], shares[], feeAmounts[], burns[])`
@@ -77,7 +77,7 @@ Users have two self-service functions that work without any privileged role:
 - Fee shares are withheld by the contract (performance fee), the rest is redeemed to USDC
 - USDC goes directly to the user, OR if `burns[]` is provided, gets bridged back via CCTP
 - Passing `shares[i] = 0` means "withdraw everything I have in this vault"
-- **Requires:** user has pre-approved the contract to spend their vault shares/aTokens
+- **Requires:** user has pre-approved the contract to spend their vault shares
 
 **Why this matters for security:** These functions give users a **trustless exit**. Even if our backend goes down, the executor key is lost, or we stop operating, any user can call `selfBatchWithdraw` directly and get their money back. No owner/executor involvement needed.
 
@@ -91,7 +91,7 @@ The single most important security mechanism is the **vault whitelist**. Every f
 - The whitelist prevents the contract from ever sending user funds to an arbitrary address
 - This is the primary defense against a compromised executor — even with full executor access, funds can only flow to pre-approved vaults
 
-**What goes on the whitelist:** Legitimate Morpho ERC4626 vault addresses and the Aave V3 Pool address. If a malicious address were added, it could potentially steal funds routed to it. Vetting the whitelist is critical.
+**What goes on the whitelist:** Legitimate ERC4626 vault addresses (Morpho vaults). If a malicious address were added, it could potentially steal funds routed to it. Vetting the whitelist is critical.
 
 ---
 
