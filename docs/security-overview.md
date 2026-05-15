@@ -1,5 +1,7 @@
 # QuicknodeEarn Contract — Security Overview
 
+> Covers `QuicknodeEarnProxy.sol` (the deployed UUPS implementation behind the proxy at `0x48b415841165304f7EfaA7D5dD5FC65cc7B4bd8e` on every supported chain). `QuicknodeEarn.sol` is a non-upgradeable reference variant kept for audit parity — same interface, no UUPS plumbing.
+
 ## What does this contract do?
 
 The contract is a **routing layer** for USDC. It doesn't hold user funds long-term — it acts as a middleman that moves a user's USDC into and out of yield-bearing ERC4626 vaults (Morpho). Think of it like a concierge: the user says "put my money here," and the contract does the paperwork.
@@ -76,7 +78,7 @@ Users have two self-service functions that work without any privileged role:
 - User closes their positions across one or more vaults
 - Fee shares are withheld by the contract (performance fee), the rest is redeemed to USDC
 - USDC goes directly to the user, OR if `burns[]` is provided, gets bridged back via CCTP
-- Passing `shares[i] = 0` means "withdraw everything I have in this vault"
+- `shares[i]` is the **explicit gross share amount** to redeem from each vault. Passing 0 reverts (the "0 = full balance" sentinel was removed per OZ audit finding L-06 — leaving it in would have been a max-approval footgun).
 - **Requires:** user has pre-approved the contract to spend their vault shares
 
 **Why this matters for security:** These functions give users a **trustless exit**. Even if our backend goes down, the executor key is lost, or we stop operating, any user can call `selfBatchWithdraw` directly and get their money back. No owner/executor involvement needed.
@@ -129,8 +131,12 @@ The contract uses **low-level calls** to the TokenMessenger (not typed interface
 |---|---|
 | **Vault whitelist** | Funds flowing to unapproved addresses |
 | **Role separation (owner/executor/relayer)** | Single compromised key can't do everything |
-| **`Ownable2Step`** | Accidental ownership transfer (requires accept step) |
-| **`ReentrancyGuard`** | Re-entrancy attacks on all state-changing functions |
+| **`Ownable2StepUpgradeable`** | Accidental ownership transfer (requires accept step) |
+| **`ReentrancyGuardTransient`** (EIP-1153) | Re-entrancy attacks on all state-changing functions, with no persistent storage slot to drift across upgrades |
+| **ERC-7201 namespaced storage** | Slot collisions across UUPS upgrades — all mutable state lives at a fixed keccak-derived slot |
+| **CCTP hookData binding** | Compromised relayer cannot redirect bridged shares — `relayAndDeposit` verifies the `user` parameter matches the beneficiary committed in the CCTP message at burn time |
+| **`emergencyClaimBridge` escape hatch** | Stuck cross-chain deposit if the relayer is down — the burn-time beneficiary can claim minted USDC straight to their wallet |
+| **`(mintRecipient, destinationCaller)` pairing constraints** | Compromised executor cannot use `withdrawAndBridge` (or any user the `selfBatch*` paths) as a general-purpose CCTP bridge to arbitrary addresses |
 | **`SafeERC20`** | Silent failures on non-standard ERC20 tokens |
 | **`fromVault != toVault` check** | Pointless rebalances / potential exploits |
 | **Zero-address guards** | Operations with invalid addresses |
