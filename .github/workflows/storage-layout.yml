@@ -1,0 +1,92 @@
+name: Storage Layout
+
+# Per OZ audit L-10: catch storage-layout regressions before they reach chain.
+# The contract uses ERC-7201 namespaced storage so the sequential storage layout
+# must remain empty; any sequential slot would indicate a layout-shift hazard.
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/QuicknodeEarnProxy.sol'
+      - 'foundry.toml'
+      - 'package.json'
+      - '.github/storage-snapshots/EarnStorage.struct'
+      - '.github/workflows/storage-layout.yml'
+  push:
+    branches: [main]
+
+jobs:
+  validate-layout:
+    name: Validate ERC-7201 storage layout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Forge build
+        run: forge build
+
+      - name: Assert QuicknodeEarnProxy has no sequential storage slots
+        run: |
+          set -euo pipefail
+          layout=$(forge inspect QuicknodeEarnProxy storage-layout --json)
+          slot_count=$(echo "$layout" | jq '.storage | length')
+          if [ "$slot_count" -ne 0 ]; then
+            echo "::error::QuicknodeEarnProxy has ${slot_count} sequential storage slot(s); expected 0 since all state must live in the ERC-7201 namespaced struct."
+            echo "$layout" | jq '.storage'
+            exit 1
+          fi
+          echo "OK: no sequential storage slots."
+
+      - name: Assert EARN_STORAGE_LOCATION matches ERC-7201 derivation
+        run: |
+          set -euo pipefail
+          expected=$(python3 - <<'PY'
+          import hashlib, subprocess
+          # cast keccak — use subprocess so the digest matches Solidity exactly.
+          def k(data: bytes) -> bytes:
+              out = subprocess.run(['cast', 'keccak', '0x' + data.hex()], capture_output=True, text=True, check=True).stdout.strip()
+              return bytes.fromhex(out[2:])
+          inner = k(b'quicknode.earn.storage')
+          sub = (int.from_bytes(inner, 'big') - 1) % (1 << 256)
+          outer = k(sub.to_bytes(32, 'big'))
+          masked = int.from_bytes(outer, 'big') & ~0xff
+          print('0x' + masked.to_bytes(32, 'big').hex())
+          PY
+          )
+          actual=$(grep -oE 'EARN_STORAGE_LOCATION *= *0x[a-fA-F0-9]+' contracts/QuicknodeEarnProxy.sol | grep -oE '0x[a-fA-F0-9]+')
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::ERC-7201 slot mismatch: contract has ${actual}, derivation from 'quicknode.earn.storage' yields ${expected}"
+            exit 1
+          fi
+          echo "OK: EARN_STORAGE_LOCATION matches the ERC-7201 namespace 'quicknode.earn.storage'."
+
+      - name: Assert EarnStorage struct unchanged
+        run: |
+          set -euo pipefail
+          # Storage layout safety also depends on the struct's *internal* shape
+          # (field order, types). forge inspect reports zero sequential slots
+          # but cannot see inside an assembly-accessed namespaced struct. Diff
+          # the struct definition against a committed canonical snapshot so any
+          # reorder, retype, insertion, or removal fails CI.
+          actual=$(sed -n '/    struct EarnStorage {/,/^    }/p' contracts/QuicknodeEarnProxy.sol)
+          expected=$(cat .github/storage-snapshots/EarnStorage.struct)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::EarnStorage struct shape changed. If this is intentional, update .github/storage-snapshots/EarnStorage.struct and bump the implementation slot version. Diff:"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          echo "OK: EarnStorage struct matches the committed snapshot."

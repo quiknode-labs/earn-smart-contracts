@@ -12,8 +12,6 @@ describe("QuicknodeEarn", function () {
    */
   async function deployBehindProxy(
     usdcAddr: `0x${string}`,
-    aavePool: `0x${string}`,
-    aUsdc: `0x${string}`,
     msgTransmitter: `0x${string}`,
     tokenMessenger: `0x${string}`,
     ownerAddr: `0x${string}`,
@@ -22,8 +20,6 @@ describe("QuicknodeEarn", function () {
     // 1. Deploy implementation (immutables set in constructor)
     const impl = await hre.viem.deployContract("QuicknodeEarnProxy", [
       usdcAddr,
-      aavePool,
-      aUsdc,
       msgTransmitter,
       tokenMessenger,
     ]);
@@ -69,12 +65,9 @@ describe("QuicknodeEarn", function () {
     ]);
 
     // Deploy QuicknodeEarn behind proxy
-    // aavePool/aUsdc set to zero (Aave integration removed)
-    // address(0) for messageTransmitter — CCTP not exercised in these tests
+    // address(0) for messageTransmitter / tokenMessenger — CCTP not exercised in these tests
     const rebalancer = await deployBehindProxy(
       usdc.address,
-      ZERO_ADDRESS as `0x${string}`, // aavePool (deprecated)
-      ZERO_ADDRESS as `0x${string}`, // aUsdc (deprecated)
       ZERO_ADDRESS as `0x${string}`, // messageTransmitter (disabled)
       ZERO_ADDRESS as `0x${string}`, // tokenMessenger (disabled)
       owner.account.address, // owner
@@ -115,16 +108,6 @@ describe("QuicknodeEarn", function () {
       );
     });
 
-    it("should set aavePool and aUsdc to zero (deprecated)", async function () {
-      const { rebalancer } = await loadFixture(deployFixture);
-      expect(getAddress(await rebalancer.read.aavePool())).to.equal(
-        getAddress(ZERO_ADDRESS)
-      );
-      expect(getAddress(await rebalancer.read.aUsdc())).to.equal(
-        getAddress(ZERO_ADDRESS)
-      );
-    });
-
     it("should set messageTransmitter to zero when disabled", async function () {
       const { rebalancer } = await loadFixture(deployFixture);
       expect(getAddress(await rebalancer.read.messageTransmitter())).to.equal(
@@ -138,20 +121,15 @@ describe("QuicknodeEarn", function () {
           ZERO_ADDRESS,
           ZERO_ADDRESS,
           ZERO_ADDRESS,
-          ZERO_ADDRESS,
-          ZERO_ADDRESS,
         ])
       ).to.be.rejectedWith("ZeroAddress");
     });
 
     it("should revert on zero owner in initialize", async function () {
-      const [owner] = await hre.viem.getWalletClients();
       const usdc = await hre.viem.deployContract("MockERC20", ["USDC", "USDC", 6]);
       await expect(
         deployBehindProxy(
           usdc.address,
-          ZERO_ADDRESS as `0x${string}`,
-          ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
           ZERO_ADDRESS as `0x${string}`,
@@ -168,8 +146,6 @@ describe("QuicknodeEarn", function () {
         usdc.address,
         ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
         [vault.address],
       );
@@ -184,8 +160,6 @@ describe("QuicknodeEarn", function () {
       const vault = await hre.viem.deployContract("MockERC4626", [usdc.address, "V", "V"]);
       const rebalancer = await deployBehindProxy(
         usdc.address,
-        ZERO_ADDRESS as `0x${string}`,
-        ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
         ZERO_ADDRESS as `0x${string}`,
         owner.account.address,
@@ -389,6 +363,14 @@ describe("QuicknodeEarn", function () {
       const userShares = await vaultA.read.balanceOf([user.account.address]);
       await vaultAAsUser.write.approve([rebalancer.address, userShares * 2n]); // extra for fees
 
+      // User approves rebalancer to spend vaultB shares (required by toVault allowance check)
+      const vaultBAsUser = await hre.viem.getContractAt(
+        "MockERC4626",
+        vaultB.address,
+        { client: { wallet: user } }
+      );
+      await vaultBAsUser.write.approve([rebalancer.address, userShares * 2n]);
+
       return { ...base, depositAmount, userShares };
     }
 
@@ -440,22 +422,26 @@ describe("QuicknodeEarn", function () {
       expect(rebalancerSharesA).to.equal(feeShares);
     });
 
-    it("should revert if fromVault not approved", async function () {
+    it("should succeed when fromVault is delisted (source-side not checked)", async function () {
       const { rebalancer, vaultA, vaultB, user, userShares } =
         await loadFixture(depositedFixture);
 
       await rebalancer.write.removeVault([vaultA.address]);
 
-      await expect(
-        rebalancer.write.rebalance([
-          user.account.address,
-          vaultA.address,
-          vaultB.address,
-          userShares,
-          [],
-          [],
-        ])
-      ).to.be.rejectedWith("VaultNotApproved");
+      // Rebalance should succeed — only toVault must be whitelisted
+      await rebalancer.write.rebalance([
+        user.account.address,
+        vaultA.address,
+        vaultB.address,
+        userShares,
+        [],
+        [],
+      ]);
+
+      const remainingA = await vaultA.read.balanceOf([user.account.address]);
+      expect(remainingA).to.equal(0n);
+      const sharesB = await vaultB.read.balanceOf([user.account.address]);
+      expect(sharesB > 0n).to.be.true;
     });
 
     it("should revert if toVault not approved", async function () {
@@ -714,37 +700,41 @@ describe("QuicknodeEarn", function () {
       expect(usdcAfter > usdcBefore).to.be.true;
     });
 
-    it("should use full balance when shares[i] == 0", async function () {
-      const { usdc, vaultA, vaultB, user, rebalancerAsUser } =
+    it("should revert with ZeroAmount when shares[i] == 0 (L-06: sentinel removed)", async function () {
+      const { vaultA, vaultB, rebalancerAsUser } =
         await loadFixture(depositedMultiFixture);
 
-      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
-
-      await rebalancerAsUser.write.selfBatchWithdraw([
-        [vaultA.address, vaultB.address],
-        [0n, 0n],   // 0 = full balance
-        [0n, 0n],
-        [],  // no burns
-      ]);
-
-      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
-      expect(usdcAfter - usdcBefore).to.equal(parseUnits("800", 6));
+      // Per OZ audit L-06, the (shares[i] == 0 → full balance) sentinel was
+      // removed to close the max-approval footgun. Callers must pass an
+      // explicit gross share amount; a zero entry now reverts.
+      await expect(
+        rebalancerAsUser.write.selfBatchWithdraw([
+          [vaultA.address, vaultB.address],
+          [0n, 0n],
+          [0n, 0n],
+          [],
+        ])
+      ).to.be.rejectedWith("ZeroAmount");
     });
 
-    it("should revert on non-whitelisted vault", async function () {
-      const { rebalancer, vaultA, user, sharesA, rebalancerAsUser } =
+    it("should succeed when vault is delisted (source-side not checked on withdraw)", async function () {
+      const { rebalancer, usdc, vaultA, user, sharesA, rebalancerAsUser } =
         await loadFixture(depositedMultiFixture);
 
       await rebalancer.write.removeVault([vaultA.address]);
 
-      await expect(
-        rebalancerAsUser.write.selfBatchWithdraw([
-          [vaultA.address],
-          [sharesA],
-          [0n],
-          [],  // no burns
-        ])
-      ).to.be.rejectedWith("VaultNotApproved");
+      const usdcBefore = await usdc.read.balanceOf([user.account.address]);
+
+      // Withdraw should succeed — whitelist only checked on deposits
+      await rebalancerAsUser.write.selfBatchWithdraw([
+        [vaultA.address],
+        [sharesA],
+        [0n],
+        [],  // no burns
+      ]);
+
+      const usdcAfter = await usdc.read.balanceOf([user.account.address]);
+      expect(usdcAfter > usdcBefore).to.be.true;
     });
 
     it("should revert on mismatched array lengths", async function () {
@@ -826,6 +816,14 @@ describe("QuicknodeEarn", function () {
       const userShares = await vaultA.read.balanceOf([user.account.address]);
       await vaultAAsUser.write.approve([rebalancer.address, userShares]);
 
+      // User approves rebalancer to spend vaultB shares (required by toVault allowance check)
+      const vaultBAsUser = await hre.viem.getContractAt(
+        "MockERC4626",
+        vaultB.address,
+        { client: { wallet: user } }
+      );
+      await vaultBAsUser.write.approve([rebalancer.address, userShares]);
+
       // Rebalance with fee to accrue fee shares in the contract (owner is executor)
       const feeShares = userShares / 100n; // 1%
       await rebalancer.write.rebalance([
@@ -895,15 +893,15 @@ describe("QuicknodeEarn", function () {
       expect(await rebalancer.read.isVaultApproved([vaultB.address])).to.be.false;
     });
 
-    it("vaultList is enumerable", async function () {
+    it("getApprovedVaults returns vaults in order", async function () {
       const { rebalancer, vaultA, vaultB } = await loadFixture(deployFixture);
       await rebalancer.write.addVault([vaultA.address]);
       await rebalancer.write.addVault([vaultB.address]);
 
-      const v0 = await rebalancer.read.vaultList([0n]);
-      const v1 = await rebalancer.read.vaultList([1n]);
-      expect(getAddress(v0)).to.equal(getAddress(vaultA.address));
-      expect(getAddress(v1)).to.equal(getAddress(vaultB.address));
+      const vaults = await rebalancer.read.getApprovedVaults();
+      expect(vaults.length).to.equal(2);
+      expect(getAddress(vaults[0])).to.equal(getAddress(vaultA.address));
+      expect(getAddress(vaults[1])).to.equal(getAddress(vaultB.address));
     });
   });
 
@@ -932,6 +930,245 @@ describe("QuicknodeEarn", function () {
       expect(getAddress(await rebalancer.read.owner())).to.equal(
         getAddress(other.account.address)
       );
+    });
+  });
+
+  // --- UUPS Upgrade ---
+
+  describe("UUPS Upgrade", function () {
+    it("owner can upgrade implementation", async function () {
+      const { rebalancer, usdc, vaultA, owner } = await loadFixture(deployFixture);
+
+      // Add a vault and set executor to verify state survives upgrade
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      // Deploy a new implementation
+      const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+      ]);
+
+      // Upgrade
+      await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
+
+      // Verify state is preserved through the upgrade
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.true;
+      expect(getAddress(await rebalancer.read.executor())).to.equal(
+        getAddress(owner.account.address)
+      );
+      expect(getAddress(await rebalancer.read.owner())).to.equal(
+        getAddress(owner.account.address)
+      );
+    });
+
+    it("non-owner cannot upgrade", async function () {
+      const { rebalancer, usdc, other } = await loadFixture(deployFixture);
+
+      const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+      ]);
+
+      const rebalancerAsOther = await hre.viem.getContractAt(
+        "QuicknodeEarnProxy",
+        rebalancer.address,
+        { client: { wallet: other } }
+      );
+      await expect(
+        rebalancerAsOther.write.upgradeToAndCall([newImpl.address, "0x"])
+      ).to.be.rejectedWith("OwnableUnauthorizedAccount");
+    });
+
+    it("implementation cannot be initialized directly", async function () {
+      const { usdc, owner } = await loadFixture(deployFixture);
+
+      const impl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+      ]);
+
+      // InvalidInitialization() selector = 0xf92ee8a9
+      await expect(
+        impl.write.initialize([owner.account.address, []])
+      ).to.be.rejectedWith("0xf92ee8a9");
+    });
+  });
+
+  // --- ERC-7201 Storage Isolation ---
+
+  describe("ERC-7201 Storage", function () {
+    it("state persists across upgrades (namespaced storage)", async function () {
+      const { rebalancer, usdc, vaultA, vaultB, owner, user } =
+        await loadFixture(deployFixture);
+
+      // Set up state: vaults, roles
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+      await rebalancer.write.setExecutor([user.account.address]);
+      await rebalancer.write.setRelayer([owner.account.address]);
+
+      // Deploy new impl and upgrade
+      const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+      ]);
+      await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
+
+      // All ERC-7201 namespaced state must survive
+      const vaults = await rebalancer.read.getApprovedVaults();
+      expect(vaults.length).to.equal(2);
+      expect(await rebalancer.read.isVaultApproved([vaultA.address])).to.be.true;
+      expect(await rebalancer.read.isVaultApproved([vaultB.address])).to.be.true;
+      expect(getAddress(await rebalancer.read.executor())).to.equal(
+        getAddress(user.account.address)
+      );
+      expect(getAddress(await rebalancer.read.relayer())).to.equal(
+        getAddress(owner.account.address)
+      );
+    });
+
+    it("ownership state persists across upgrades (OZ namespaced storage)", async function () {
+      const { rebalancer, usdc, owner } = await loadFixture(deployFixture);
+
+      const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address,
+        ZERO_ADDRESS,
+        ZERO_ADDRESS,
+      ]);
+      await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
+
+      expect(getAddress(await rebalancer.read.owner())).to.equal(
+        getAddress(owner.account.address)
+      );
+    });
+
+    it("functional operations work after upgrade", async function () {
+      const { rebalancer, usdc, vaultA, vaultB, user, owner } =
+        await loadFixture(deployFixture);
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      // Deposit as user
+      const depositAmount = parseUnits("1000", 6);
+      const usdcAsUser = await hre.viem.getContractAt(
+        "MockERC20", usdc.address, { client: { wallet: user } }
+      );
+      await usdcAsUser.write.approve([rebalancer.address, depositAmount]);
+
+      const rebalancerAsUser = await hre.viem.getContractAt(
+        "QuicknodeEarnProxy", rebalancer.address, { client: { wallet: user } }
+      );
+      await rebalancerAsUser.write.selfBatchDeposit([
+        [vaultA.address], [depositAmount], [],
+      ]);
+
+      // Upgrade
+      const newImpl = await hre.viem.deployContract("QuicknodeEarnProxy", [
+        usdc.address, ZERO_ADDRESS, ZERO_ADDRESS,
+      ]);
+      await rebalancer.write.upgradeToAndCall([newImpl.address, "0x"]);
+
+      // Approve shares for rebalance after upgrade
+      const vaultAAsUser = await hre.viem.getContractAt(
+        "MockERC4626", vaultA.address, { client: { wallet: user } }
+      );
+      const vaultBAsUser = await hre.viem.getContractAt(
+        "MockERC4626", vaultB.address, { client: { wallet: user } }
+      );
+      const userShares = await vaultA.read.balanceOf([user.account.address]);
+      await vaultAAsUser.write.approve([rebalancer.address, userShares]);
+      await vaultBAsUser.write.approve([rebalancer.address, userShares]);
+
+      // Rebalance should work after upgrade
+      await rebalancer.write.rebalance([
+        user.account.address,
+        vaultA.address,
+        vaultB.address,
+        userShares,
+        [],
+        [],
+      ]);
+
+      expect(await vaultA.read.balanceOf([user.account.address])).to.equal(0n);
+      const sharesB = await vaultB.read.balanceOf([user.account.address]);
+      expect(sharesB > 0n).to.be.true;
+    });
+  });
+
+  // --- Input Validation (Finding #6) ---
+
+  describe("Input Validation", function () {
+    it("rebalance reverts on zero shares", async function () {
+      const { rebalancer, vaultA, vaultB, owner, user } =
+        await loadFixture(deployFixture);
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      await expect(
+        rebalancer.write.rebalance([
+          user.account.address, vaultA.address, vaultB.address,
+          0n, [], [],
+        ])
+      ).to.be.rejectedWith("ZeroAmount");
+    });
+
+    it("rebalance reverts when fromVault == toVault", async function () {
+      const { rebalancer, vaultA, owner, user } =
+        await loadFixture(deployFixture);
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      await expect(
+        rebalancer.write.rebalance([
+          user.account.address, vaultA.address, vaultA.address,
+          parseUnits("100", 6), [], [],
+        ])
+      ).to.be.rejectedWith("InvalidInput");
+    });
+
+    it("rebalance reverts on fee array length mismatch", async function () {
+      const { rebalancer, vaultA, vaultB, owner, user } =
+        await loadFixture(deployFixture);
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      await expect(
+        rebalancer.write.rebalance([
+          user.account.address, vaultA.address, vaultB.address,
+          parseUnits("100", 6),
+          [vaultA.address], // 1 fee vault
+          [],               // 0 fee amounts — mismatch
+        ])
+      ).to.be.rejectedWith("ArrayLengthMismatch");
+    });
+
+    it("rebalance reverts when user has no toVault allowance", async function () {
+      const { rebalancer, vaultA, vaultB, owner, user } =
+        await loadFixture(deployFixture);
+
+      await rebalancer.write.addVault([vaultA.address]);
+      await rebalancer.write.addVault([vaultB.address]);
+      await rebalancer.write.setExecutor([owner.account.address]);
+
+      // User has NO vaultB share approval
+      await expect(
+        rebalancer.write.rebalance([
+          user.account.address, vaultA.address, vaultB.address,
+          parseUnits("100", 6), [], [],
+        ])
+      ).to.be.rejectedWith("InvalidInput");
     });
   });
 });

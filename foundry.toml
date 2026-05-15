@@ -1,15 +1,17 @@
 [profile.default]
 src = "contracts"
 out = "out"
-libs = ["lib"]
+libs = ["lib", "node_modules"]
 remappings = [
-    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
     "forge-std/=lib/forge-std/src/",
 ]
 solc = "0.8.28"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
+evm_version = "cancun"
 bytecode_hash = "none"
 
 [rpc_endpoints]

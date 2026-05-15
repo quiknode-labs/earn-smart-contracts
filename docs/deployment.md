@@ -67,6 +67,10 @@ bytecode_hash = "none"   # strips IPFS metadata hash from CBOR; required for Sou
 
 The contract is deployed through the [CreateX](https://github.com/pcaversaccio/createx) factory (`0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed`), which is deployed at the same address on every EVM chain. This produces a deterministic address controlled by the deployer and the salt version.
 
+Use `deployProxy(uint32)` (or `deployProxyWithVaults`) to deploy the UUPS-upgradeable `QuicknodeEarnProxy.sol`. The implementation is deployed via plain `CREATE`; the ERC1967 proxy is deployed via CreateX CREATE3 and immediately delegates to `initialize(owner, vaults)` to set ownership and seed the vault whitelist. Subsequent upgrades to an existing proxy deployment use `executeUpgrade(uint32)` (see section 1.5).
+
+The legacy non-proxy entry points `run(uint32)` and `runWithVaults(uint32)` deploy `QuicknodeEarn.sol` (the non-upgradeable variant) directly via CreateX CREATE3 and remain in `Deploy.s.sol` for reference, but should not be used for new deployments.
+
 ```bash
 # Load env vars
 source ../.env

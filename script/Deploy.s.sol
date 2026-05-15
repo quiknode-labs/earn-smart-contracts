@@ -30,8 +30,6 @@ contract DeployQuicknodeEarn is Script {
     // Per-chain constructor args (immutables baked into bytecode)
     struct ChainConfig {
         address usdc;
-        address aavePool;        // deprecated (Aave removed) — always address(0)
-        address aUsdc;           // deprecated (Aave removed) — always address(0)
         address msgTransmitter;  // zero if CCTP not on chain
         address tokenMessenger;  // zero if CCTP not on chain
     }
@@ -40,56 +38,42 @@ contract DeployQuicknodeEarn is Script {
         if (chainId == 1) { // Ethereum
             return ChainConfig({
                 usdc:            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 10) { // Optimism
             return ChainConfig({
                 usdc:            0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 130) { // Unichain
             return ChainConfig({
                 usdc:            0x078D782b760474a361dDA0AF3839290b0EF57AD6,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 137) { // Polygon
             return ChainConfig({
                 usdc:            0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 143) { // Monad
             return ChainConfig({
                 usdc:            0x754704Bc059F8C67012fEd69BC8A327a5aafb603,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 8453) { // Base
             return ChainConfig({
                 usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
         } else if (chainId == 42161) { // Arbitrum
             return ChainConfig({
                 usdc:            0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
-                aavePool:        address(0),
-                aUsdc:           address(0),
                 msgTransmitter:  MSG_TRANSMITTER,
                 tokenMessenger:  TOKEN_MESSENGER
             });
@@ -122,8 +106,6 @@ contract DeployQuicknodeEarn is Script {
             type(QuicknodeEarn).creationCode,
             abi.encode(
                 cfg.usdc,
-                cfg.aavePool,
-                cfg.aUsdc,
                 cfg.msgTransmitter,
                 cfg.tokenMessenger,
                 deployer,
@@ -174,8 +156,6 @@ contract DeployQuicknodeEarn is Script {
             type(QuicknodeEarn).creationCode,
             abi.encode(
                 cfg.usdc,
-                cfg.aavePool,
-                cfg.aUsdc,
                 cfg.msgTransmitter,
                 cfg.tokenMessenger,
                 deployer,
@@ -222,8 +202,6 @@ contract DeployQuicknodeEarn is Script {
         // Step 1: Deploy implementation (regular CREATE — address doesn't matter)
         QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );
@@ -280,8 +258,6 @@ contract DeployQuicknodeEarn is Script {
 
         QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );
@@ -309,6 +285,108 @@ contract DeployQuicknodeEarn is Script {
         console.log("USDC:       ", address(rebalancer.usdc()));
     }
 
+    /// @notice Fresh CREATE3 deploy of a new ERC1967Proxy + impl at a parameterised
+    ///         salt version, with executor and relayer wired up in the same broadcast.
+    ///         Used to ship a parallel deployment alongside an existing v11 proxy
+    ///         (e.g. after a contract upgrade) without disturbing live users.
+    ///
+    /// @dev    Flow per chain:
+    ///         1. Read EXECUTOR_ADDRESS and RELAYER_ADDRESS from env. Require that
+    ///            the deployer EOA == EXECUTOR_ADDRESS so a single broadcast can
+    ///            both deploy the proxy and call the owner-only setter functions.
+    ///         2. Deploy implementation (regular CREATE).
+    ///         3. Deploy ERC1967Proxy via CreateX CREATE3 with the supplied salt
+    ///            version. Init data calls `initialize(deployer, initialVaults)`
+    ///            inside the proxy's constructor — owner is set to deployer
+    ///            (== executor), vault whitelist is seeded.
+    ///         4. Owner calls `setExecutor(EXECUTOR_ADDRESS)` and
+    ///            `setRelayer(RELAYER_ADDRESS)`.
+    ///         5. Post-deploy assertions: owner == executor address,
+    ///            executor == EXECUTOR_ADDRESS, relayer == RELAYER_ADDRESS,
+    ///            vault count == initialVaults.length. Reverts if any mismatch.
+    ///
+    /// @param chainId         Target chain id (must match the connected RPC).
+    /// @param saltVersion     CreateX salt version. Existing prod uses v11 — bump to
+    ///                        v12+ to get a new deterministic proxy address.
+    /// @param initialVaults   Vaults to whitelist in `initialize`. Owner can later
+    ///                        add more via `addVault`/`batchAddVaults` or remove
+    ///                        any via `removeVault`.
+    function deployFreshProxy(
+        uint32 chainId,
+        uint96 saltVersion,
+        address[] calldata initialVaults
+    ) external {
+        ChainConfig memory cfg = getConfig(chainId);
+
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address deployer    = vm.addr(deployerKey);
+        address executorAddr = vm.envAddress("EXECUTOR_ADDRESS");
+        address relayerAddr  = vm.envAddress("RELAYER_ADDRESS");
+
+        require(
+            deployer == executorAddr,
+            "deployer EOA must equal EXECUTOR_ADDRESS for single-broadcast deploy"
+        );
+        require(saltVersion != 11, "salt v11 is occupied by the existing prod proxy");
+
+        // Salt format: first 20 bytes = deployer, last 12 bytes = version
+        bytes32 salt = bytes32(abi.encodePacked(deployer, bytes12(saltVersion)));
+
+        console.log("=== Fresh proxy deploy ===");
+        console.log("Chain ID:        ", chainId);
+        console.log("Salt version:    ", saltVersion);
+        console.log("Deployer:        ", deployer);
+        console.log("Executor (env):  ", executorAddr);
+        console.log("Relayer  (env):  ", relayerAddr);
+        console.log("Initial vaults:  ", initialVaults.length);
+
+        vm.startBroadcast(deployerKey);
+
+        // Step 1: deploy implementation (regular CREATE)
+        QuicknodeEarnProxy impl = new QuicknodeEarnProxy(
+            cfg.usdc,
+            cfg.msgTransmitter,
+            cfg.tokenMessenger
+        );
+
+        // Step 2: deploy ERC1967Proxy via CreateX CREATE3 — initializes inside constructor
+        bytes memory initData = abi.encodeCall(
+            QuicknodeEarnProxy.initialize,
+            (deployer, initialVaults)
+        );
+        bytes memory proxyInitCode = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(address(impl), initData)
+        );
+        address proxy = ICreateX(CREATEX).deployCreate3(salt, proxyInitCode);
+
+        // Step 3: wire executor and relayer (owner-only — works because deployer is owner)
+        QuicknodeEarnProxy rebalancer = QuicknodeEarnProxy(proxy);
+        rebalancer.setExecutor(executorAddr);
+        rebalancer.setRelayer(relayerAddr);
+
+        vm.stopBroadcast();
+
+        // Step 4: post-deploy assertions — fail loudly if anything is misconfigured
+        require(proxy != address(0), "Proxy deploy failed");
+        require(rebalancer.owner()    == executorAddr, "owner != EXECUTOR_ADDRESS");
+        require(rebalancer.executor() == executorAddr, "executor != EXECUTOR_ADDRESS");
+        require(rebalancer.relayer()  == relayerAddr,  "relayer != RELAYER_ADDRESS");
+        require(
+            rebalancer.getApprovedVaults().length == initialVaults.length,
+            "vault count mismatch"
+        );
+
+        console.log("--- Deployment complete ---");
+        console.log("Implementation:  ", address(impl));
+        console.log("Proxy:           ", proxy);
+        console.log("Owner:           ", rebalancer.owner());
+        console.log("Executor:        ", rebalancer.executor());
+        console.log("Relayer:         ", rebalancer.relayer());
+        console.log("Vaults seeded:   ", rebalancer.getApprovedVaults().length);
+        console.log("USDC:            ", address(rebalancer.usdc()));
+    }
+
     /// @notice Deploy a new impl without upgrading. Owner must call upgradeToAndCall separately.
     ///         For the current setup where owner == deployer, use executeUpgrade instead.
     function deployProxyImpl(uint32 chainId) external returns (address impl) {
@@ -324,8 +402,6 @@ contract DeployQuicknodeEarn is Script {
         vm.startBroadcast(deployerKey);
         impl = address(new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         ));
@@ -360,8 +436,6 @@ contract DeployQuicknodeEarn is Script {
         // Step 1: Deploy new implementation with this chain's per-chain immutables.
         QuicknodeEarnProxy newImpl = new QuicknodeEarnProxy(
             cfg.usdc,
-            cfg.aavePool,
-            cfg.aUsdc,
             cfg.msgTransmitter,
             cfg.tokenMessenger
         );

@@ -1,30 +1,58 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.28;
 
-import "@openzeppelin/contracts/access/Ownable2Step.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC4626.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-/// @dev Minimal CCTP V2 MessageTransmitter interface for relaying messages
+/// @dev Minimal Circle CCTP V2 MessageTransmitter interface.
+///      Used by `relayAndDeposit` to finalize a cross-chain transfer: the relayer
+///      submits the original CCTP message + Circle attestation, which mints USDC
+///      on the destination chain.
 interface IMessageTransmitter {
+    /// @notice Verify `attestation` against Circle's attester set and execute the
+    ///         embedded mint. Returns true on success; reverts on invalid attestation
+    ///         or replayed nonce.
+    /// @param message     The raw CCTP message emitted on the source chain.
+    /// @param attestation Circle-signed attestation bytes (from the Iris API).
     function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool);
 }
 
-/// @dev Minimal CCTP V2 TokenMessenger interface for cross-chain burns
+/// @dev Minimal Circle CCTP V2 TokenMessenger interface for cross-chain burns.
+///      `depositForBurnWithHook` is called via low-level `call` in `_cctpBurn`
+///      rather than a typed interface call so it tolerates ABI variation across
+///      CCTP V2 proxy deployments — a typed void-return call would revert on any
+///      proxy that surfaces non-empty return data, while a typed bytes-returning
+///      call would revert on any proxy that returns nothing. The low-level call
+///      simply checks `success` and discards the return data.
 interface ITokenMessengerV2 {
-    function depositForBurn(
+    /// @notice Burn `amount` of `burnToken` on the source chain and arrange a mint
+    ///         of the same amount (minus fees) to `mintRecipient` on `destinationDomain`.
+    ///         `hookData` is committed into the signed message and forwarded on the
+    ///         destination chain — this contract encodes the beneficiary address there
+    ///         so `relayAndDeposit` can verify the intended vault-share recipient.
+    /// @param amount               USDC amount to burn.
+    /// @param destinationDomain    CCTP domain ID of the target chain.
+    /// @param mintRecipient        bytes32-encoded address that will receive minted USDC.
+    /// @param burnToken            The token to burn (USDC).
+    /// @param destinationCaller    If non-zero, only this address may call `receiveMessage`.
+    /// @param maxFee               Maximum fee (in USDC) the relayer may deduct.
+    /// @param minFinalityThreshold Minimum source-chain finality before attestation.
+    /// @param hookData             Arbitrary bytes forwarded to the destination — we encode
+    ///                             the beneficiary address for on-chain verification.
+    function depositForBurnWithHook(
         uint256 amount,
         uint32 destinationDomain,
         bytes32 mintRecipient,
         address burnToken,
         bytes32 destinationCaller,
         uint256 maxFee,
-        uint32 minFinalityThreshold
-    ) external returns (bytes32);
+        uint32 minFinalityThreshold,
+        bytes calldata hookData
+    ) external;
 }
 
 /// @notice Parameters for a single CCTP V2 cross-chain burn within `selfBatchDeposit`
@@ -63,7 +91,7 @@ struct BridgeBurn {
 ///        accrued yield in a single operation.
 ///      - Vault whitelist: only addresses in `approvedVaults` may receive deposits. This
 ///        prevents the owner from draining users into arbitrary contracts.
-///      - Two-step ownership (`Ownable2Step`) prevents accidental ownership transfer to
+///      - Two-step ownership (`Ownable2StepUpgradeable`) prevents accidental ownership transfer to
 ///        an uncontrolled address.
 ///      - CCTP V2 integration: `withdrawAndBridge` burns USDC cross-chain after a
 ///        vault withdrawal; `relayAndDeposit` relays a CCTP message and atomically
@@ -76,25 +104,40 @@ struct BridgeBurn {
 ///      - UUPS: only the owner may authorise an upgrade (`_authorizeUpgrade`).
 ///        The implementation's constructor calls `_disableInitializers()` to prevent
 ///        direct initialisation of the implementation contract itself.
-contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUPSUpgradeable {
+///      - All mutable state lives in ERC-7201 namespaced storage. Parents have no
+///        persistent storage that could collide: Ownable2StepUpgradeable is on an
+///        ERC-7201 namespaced layout, and ReentrancyGuardTransient uses transient
+///        storage (EIP-1153 TSTORE/TLOAD) so it has no persistent slots at all.
+///        No parent or child slot is sequential, so adds and reorders in any of them
+///        cannot shift another contract's slots.
+contract QuicknodeEarnProxy is Ownable2StepUpgradeable, ReentrancyGuardTransient, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
-    // State
+    // ERC-7201 namespaced storage
+    // -------------------------------------------------------------------------
+
+    /// @custom:storage-location erc7201:quicknode.earn.storage
+    struct EarnStorage {
+        mapping(address vault => bool approved) approvedVaults;
+        address[] vaultList;
+        address executor;
+        address relayer;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("quicknode.earn.storage")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant EARN_STORAGE_LOCATION = 0xa4cde844567bd426696e28bbfd17699530d36b5e6952a4ce0ac418703884c900;
+
+    function _getEarnStorage() private pure returns (EarnStorage storage $) {
+        assembly { $.slot := EARN_STORAGE_LOCATION }
+    }
+
+    // -------------------------------------------------------------------------
+    // Immutables (stored in implementation bytecode, not proxy storage)
     // -------------------------------------------------------------------------
 
     /// @notice The USDC token this contract operates on.
     IERC20  public immutable usdc;
-
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aavePool;
-
-    /// @notice Preserved for ABI backwards compatibility with the previously deployed
-    ///         implementation. Aave integration has been removed; always `address(0)`
-    ///         in new deployments.
-    address public immutable aUsdc;
 
     /// @notice The CCTP V2 MessageTransmitter address for relaying bridge messages.
     ///         `address(0)` disables CCTP relay functionality (`relayAndDeposit` reverts).
@@ -104,22 +147,6 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///         `address(0)` disables all CCTP burn paths (`withdrawAndBridge`, `selfBatchDeposit`
     ///         with burns, and `selfBatchWithdraw` with burns will revert).
     address public immutable tokenMessenger;
-
-    /// @notice Maps vault address → whether it is whitelisted for deposits.
-    mapping(address => bool) public approvedVaults;
-
-    /// @notice Enumerable list of all currently approved vault addresses.
-    ///         Maintained in sync with `approvedVaults`.
-    address[] public vaultList;
-
-
-    /// @notice The executor address permitted to call `rebalance` and `withdrawAndBridge`.
-    ///         Set by the owner via `setExecutor()`. May be an EOA or a contract.
-    address public executor;
-
-    /// @notice The relayer address permitted to call `relayAndDeposit`.
-    ///         Set by the owner via `setRelayer()`. May be an EOA or a contract.
-    address public relayer;
 
     // -------------------------------------------------------------------------
     // Events
@@ -277,11 +304,25 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Thrown when `feeVaults` and `feeAmounts` arrays have different lengths.
     error ArrayLengthMismatch();
 
-    /// @notice Thrown when the low-level call to the CCTP TokenMessenger's `depositForBurn` fails.
+    /// @notice Thrown when the low-level call to the CCTP TokenMessenger's `depositForBurnWithHook` fails.
     error CctpBurnFailed();
 
     /// @notice Thrown when the CCTP `receiveMessage` relay call returns false.
     error MessageRelayFailed();
+
+    /// @notice Thrown when `relayAndDeposit`'s `user` parameter does not match the
+    ///         beneficiary committed in the CCTP message's hookData at burn time.
+    error InvalidUser();
+
+    /// @notice Thrown when `emergencyClaimBridge` is called by an address other than the
+    ///         hookData beneficiary committed at burn time.
+    error Unauthorized();
+
+    /// @notice Emitted when a user claims a bridged CCTP burn directly via
+    ///         `emergencyClaimBridge`, bypassing the relayer.
+    /// @param user   The hookData beneficiary who claimed the bridge.
+    /// @param amount USDC amount delivered to the beneficiary's wallet.
+    event BridgeClaimed(address indexed user, uint256 amount);
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -289,13 +330,13 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
 
     /// @dev Restricts a function to the designated executor address.
     modifier onlyExecutor() {
-        if (msg.sender != executor) revert UnauthorizedExecutor();
+        if (msg.sender != _getEarnStorage().executor) revert UnauthorizedExecutor();
         _;
     }
 
     /// @dev Restricts a function to the designated relayer address.
     modifier onlyRelayer() {
-        if (msg.sender != relayer) revert UnauthorizedRelayer();
+        if (msg.sender != _getEarnStorage().relayer) revert UnauthorizedRelayer();
         _;
     }
 
@@ -308,26 +349,19 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @dev Called once at deployment of the implementation. The proxy delegates all
     ///      calls (including `initialize`) to this contract, so this constructor only
     ///      runs against the implementation's own storage — not the proxy's.
-    ///      Pass `address(0)` for `_messageTransmitter` on chains where CCTP is not
-    ///      available. `_aavePool` and `_aUsdc` are preserved for ABI backwards
-    ///      compatibility — pass `address(0)` for both in new deployments.
+    ///      Pass `address(0)` for `_messageTransmitter` and `_tokenMessenger` on chains
+    ///      where CCTP is not available — relay/burn paths will revert with `ZeroAddress`.
     /// @param _usdc               USDC token address.
-    /// @param _aavePool           Deprecated (Aave removed). Pass `address(0)`.
-    /// @param _aUsdc              Deprecated (Aave removed). Pass `address(0)`.
     /// @param _messageTransmitter CCTP V2 MessageTransmitter; `address(0)` disables relay.
     /// @param _tokenMessenger     CCTP V2 TokenMessenger; `address(0)` disables CCTP burns.
     constructor(
         address _usdc,
-        address _aavePool,
-        address _aUsdc,
         address _messageTransmitter,
         address _tokenMessenger
-    ) Ownable(msg.sender) {
+    ) {
         if (_usdc == address(0)) revert ZeroAddress();
 
         usdc               = IERC20(_usdc);
-        aavePool           = _aavePool;
-        aUsdc              = _aUsdc;
         messageTransmitter = _messageTransmitter;
         tokenMessenger     = _tokenMessenger;
 
@@ -343,13 +377,15 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     function initialize(address _owner, address[] calldata _initialVaults) external initializer {
         if (_owner == address(0)) revert ZeroAddress();
 
-        _transferOwnership(_owner);
+        __Ownable_init(_owner);
+        __Ownable2Step_init();
 
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < _initialVaults.length; i++) {
             address vault = _initialVaults[i];
-            if (vault != address(0) && !approvedVaults[vault]) {
-                approvedVaults[vault] = true;
-                vaultList.push(vault);
+            if (vault != address(0) && !$.approvedVaults[vault]) {
+                $.approvedVaults[vault] = true;
+                $.vaultList.push(vault);
                 emit VaultAdded(vault);
             }
         }
@@ -371,9 +407,10 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @param vault The vault address to whitelist. Must not be `address(0)`.
     function addVault(address vault) external onlyOwner {
         if (vault == address(0)) revert ZeroAddress();
-        if (!approvedVaults[vault]) {
-            approvedVaults[vault] = true;
-            vaultList.push(vault);
+        EarnStorage storage $ = _getEarnStorage();
+        if (!$.approvedVaults[vault]) {
+            $.approvedVaults[vault] = true;
+            $.vaultList.push(vault);
             emit VaultAdded(vault);
         }
     }
@@ -383,12 +420,13 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      Reverts if any element is `address(0)`.
     /// @param vaults Array of vault addresses to whitelist.
     function batchAddVaults(address[] calldata vaults) external onlyOwner {
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < vaults.length; i++) {
             address vault = vaults[i];
             if (vault == address(0)) revert ZeroAddress();
-            if (!approvedVaults[vault]) {
-                approvedVaults[vault] = true;
-                vaultList.push(vault);
+            if (!$.approvedVaults[vault]) {
+                $.approvedVaults[vault] = true;
+                $.vaultList.push(vault);
                 emit VaultAdded(vault);
             }
         }
@@ -399,15 +437,16 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      Reverts if `vault` is not currently approved.
     /// @param vault The vault address to de-list.
     function removeVault(address vault) external onlyOwner {
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
-        approvedVaults[vault] = false;
+        EarnStorage storage $ = _getEarnStorage();
+        if (!$.approvedVaults[vault]) revert VaultNotApproved(vault);
+        $.approvedVaults[vault] = false;
 
         // Remove from vaultList array (swap-and-pop, does not preserve order)
-        uint256 len = vaultList.length;
+        uint256 len = $.vaultList.length;
         for (uint256 i = 0; i < len; i++) {
-            if (vaultList[i] == vault) {
-                vaultList[i] = vaultList[len - 1];
-                vaultList.pop();
+            if ($.vaultList[i] == vault) {
+                $.vaultList[i] = $.vaultList[len - 1];
+                $.vaultList.pop();
                 break;
             }
         }
@@ -422,16 +461,18 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Set the executor address permitted to call `rebalance` and `withdrawAndBridge`.
     /// @param _executor The new executor address. Use `address(0)` to revoke.
     function setExecutor(address _executor) external onlyOwner {
-        address old = executor;
-        executor = _executor;
+        EarnStorage storage $ = _getEarnStorage();
+        address old = $.executor;
+        $.executor = _executor;
         emit ExecutorUpdated(old, _executor);
     }
 
     /// @notice Set the relayer address permitted to call `relayAndDeposit`.
     /// @param _relayer The new relayer address. Use `address(0)` to revoke.
     function setRelayer(address _relayer) external onlyOwner {
-        address old = relayer;
-        relayer = _relayer;
+        EarnStorage storage $ = _getEarnStorage();
+        address old = $.relayer;
+        $.relayer = _relayer;
         emit RelayerUpdated(old, _relayer);
     }
 
@@ -445,52 +486,57 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         address user,
         address[] calldata feeVaults,
         uint256[] calldata feeAmounts
-    ) internal {
+    ) private {
         if (feeVaults.length == 0) return;
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < feeVaults.length; i++) {
             address fv = feeVaults[i];
             if (fv == address(0)) revert ZeroAddress();
-            if (!approvedVaults[fv]) revert VaultNotApproved(fv);
+            if (!$.approvedVaults[fv]) revert VaultNotApproved(fv);
             IERC20(fv).safeTransferFrom(user, address(this), feeAmounts[i]);
         }
         emit PerformanceFeeCollected(user, feeVaults, feeAmounts);
     }
 
     /// @dev Deposit USDC into an ERC4626 vault on behalf of `user`.
-    function _depositToVault(address vault, uint256 amount, address user) internal returns (uint256 sharesReceived) {
+    function _depositToVault(address vault, uint256 amount, address user) private returns (uint256 sharesReceived) {
         usdc.forceApprove(vault, amount);
-        return IERC4626(vault).deposit(amount, user);
+        sharesReceived = IERC4626(vault).deposit(amount, user);
+        if (sharesReceived == 0) revert ZeroAmount();
     }
 
     /// @dev Pull ERC4626 vault shares from `user` and redeem to USDC held by this contract.
-    function _withdrawFromVault(address vault, address user, uint256 shares) internal returns (uint256 usdcReceived) {
+    function _withdrawFromVault(address vault, address user, uint256 shares) private returns (uint256 usdcReceived) {
         IERC20(vault).safeTransferFrom(user, address(this), shares);
         usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
     }
 
-    /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger (low-level call to avoid
-    ///      proxy return-value revert). Reverts if `tokenMessenger` is unset, `amount`
-    ///      is zero, `mintRecipient` is zero, or the burn call fails / returns no data.
+    /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger using `depositForBurnWithHook`.
+    ///      `beneficiary` is ABI-encoded as hookData and committed into the signed CCTP
+    ///      message, allowing `relayAndDeposit` on the destination chain to verify the
+    ///      intended vault-share recipient. Low-level call avoids proxy return-value revert.
     function _cctpBurn(
         uint256 amount,
         uint32  destDomain,
         bytes32 mintRecipient,
         bytes32 destinationCaller,
         uint256 maxFee,
-        uint32  minFinalityThreshold
-    ) internal {
+        uint32  minFinalityThreshold,
+        address beneficiary
+    ) private {
         if (tokenMessenger == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (mintRecipient == bytes32(0)) revert ZeroAddress();
-        usdc.forceApprove(tokenMessenger, amount);
-        (bool success, bytes memory ret) = tokenMessenger.call(
-            abi.encodeWithSelector(
-                ITokenMessengerV2.depositForBurn.selector,
-                amount, destDomain, mintRecipient, address(usdc),
-                destinationCaller, maxFee, minFinalityThreshold
+        // Approval is now hoisted to each call site (selfBatchDeposit, selfBatchWithdraw,
+        // withdrawAndBridge) so a batch of burns issues a single forceApprove instead of N.
+        (bool success, ) = tokenMessenger.call(
+            abi.encodeCall(
+                ITokenMessengerV2.depositForBurnWithHook,
+                (amount, destDomain, mintRecipient, address(usdc),
+                 destinationCaller, maxFee, minFinalityThreshold, abi.encode(beneficiary))
             )
         );
-        if (!success || ret.length < 32) revert CctpBurnFailed();
+        if (!success) revert CctpBurnFailed();
     }
 
     // -------------------------------------------------------------------------
@@ -506,7 +552,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      The user must have pre-approved this contract to spend their `fromVault`
     ///      ERC4626 shares and any fee vault tokens before the rebalancer calls this.
     /// @param user       The user whose position is being rebalanced.
-    /// @param fromVault  The vault to withdraw from. Must be whitelisted.
+    /// @param fromVault  The vault to withdraw from.
     /// @param toVault    The vault to deposit into. Must be whitelisted.
     /// @param shares     ERC4626 shares to move.
     /// @param feeVaults  Vault addresses from which to collect performance fee shares.
@@ -520,17 +566,27 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         address[] calldata feeVaults,
         uint256[] calldata feeAmounts
     ) external onlyExecutor nonReentrant {
-        if (!approvedVaults[fromVault]) revert VaultNotApproved(fromVault);
-        if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
+        if (shares == 0) revert ZeroAmount();
+        if (fromVault == toVault) revert InvalidInput();
+        if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
+        if (!_getEarnStorage().approvedVaults[toVault]) revert VaultNotApproved(toVault);
+        if (IERC20(toVault).allowance(user, address(this)) == 0) revert InvalidInput();
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
 
         // --- Withdrawal leg ---
+        uint256 before = usdc.balanceOf(address(this));
         uint256 usdcReceived = _withdrawFromVault(fromVault, user, shares);
 
         // --- Deposit leg (full amount — fees already taken as shares) ---
         _depositToVault(toVault, usdcReceived, user);
+
+        // --- Return any remainder to the user ---
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(user, remainder);
+        }
 
         emit Rebalanced(user, fromVault, toVault, shares, usdcReceived);
     }
@@ -551,7 +607,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      front-running the relay and stealing the minted USDC.
     ///      Performance fees are collected as vault shares before the withdrawal.
     /// @param user                  The user whose vault position is bridged.
-    /// @param vault                 The vault to withdraw from. Must be whitelisted.
+    /// @param vault                 The vault to withdraw from.
     /// @param shares                ERC4626 shares to redeem.
     /// @param feeVaults             Vault addresses from which to collect performance fee shares.
     /// @param feeAmounts            Corresponding share amounts to collect from each vault in `feeVaults`.
@@ -574,7 +630,20 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         uint256 maxFee,
         uint32  minFinalityThreshold
     ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
-        if (!approvedVaults[vault]) revert VaultNotApproved(vault);
+        if (shares == 0) revert ZeroAmount();
+        if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
+
+        // Allowed pairings:
+        //   (this, this)  — MEV-protected cross-chain rebalance; the relayer
+        //                   completes the deposit via relayAndDeposit.
+        //   (user,   0)   — permissionless cross-chain exit; anyone can call
+        //                   receiveMessage on the destination chain to mint USDC
+        //                   directly to the user's wallet.
+        bytes32 selfB = bytes32(uint256(uint160(address(this))));
+        bytes32 userB = bytes32(uint256(uint160(user)));
+        bool isRebalance = (mintRecipient == selfB && destinationCaller == selfB);
+        bool isExit      = (mintRecipient == userB && destinationCaller == bytes32(0));
+        if (!isRebalance && !isExit) revert InvalidInput();
 
         // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
@@ -582,8 +651,9 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         // --- Withdrawal ---
         netUsdc = _withdrawFromVault(vault, user, shares);
 
-        // --- CCTP burn ---
-        _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold);
+        // --- CCTP burn (hookData = user, verified by relayAndDeposit on dest chain) ---
+        usdc.forceApprove(tokenMessenger, netUsdc);
+        _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold, user);
 
         emit BridgeInitiated(user, vault, shares, netUsdc, destDomain);
     }
@@ -620,9 +690,18 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         uint256[] calldata amounts
     ) external onlyRelayer nonReentrant {
         if (vaults.length == 0) revert InvalidInput();
+        if (vaults.length != amounts.length) revert ArrayLengthMismatch();
 
+        // Verify `user` matches the beneficiary committed in hookData at burn time.
+        // CCTP V2 message layout: 148-byte header + 228-byte burn body = 376 bytes
+        // before hookData; beneficiary is abi.encode(address) = 32 bytes.
+        if (message.length < 408) revert InvalidInput();
+        if (abi.decode(message[376:408], (address)) != user) revert InvalidUser();
+
+        EarnStorage storage $ = _getEarnStorage();
         for (uint256 i = 0; i < vaults.length; i++) {
-            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (!$.approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (IERC20(vaults[i]).allowance(user, address(this)) == 0) revert InvalidInput();
         }
 
         // Step 1: Snapshot USDC balance before relay
@@ -644,6 +723,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         for (uint256 i = 0; i < vaults.length; i++) {
             uint256 sharesReceived = _depositToVault(vaults[i], amounts[i], user);
             emit DepositedFromBridge(user, vaults[i], amounts[i], sharesReceived);
+        }
+
+        // Step 5: Return any remainder to the user (e.g. CCTP fee buffer)
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(user, remainder);
         }
     }
 
@@ -676,19 +761,32 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
 
         // Validate all vaults and compute total USDC needed
-        uint256 total = 0;
+        EarnStorage storage $ = _getEarnStorage();
+        uint256 localTotal = 0;
         for (uint256 i = 0; i < vaults.length; i++) {
-            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (!$.approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
             if (amounts[i] == 0) revert ZeroAmount();
-            total += amounts[i];
+            localTotal += amounts[i];
         }
+        // Per-burn allowed pairings:
+        //   (this, this)       — MEV-protected vault deposit on dest chain via relayAndDeposit.
+        //   (msg.sender, 0)    — permissionless mint back to caller's wallet on dest chain.
+        bytes32 selfB = bytes32(uint256(uint160(address(this))));
+        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
+        uint256 burnTotal = 0;
         for (uint256 i = 0; i < burns.length; i++) {
             if (burns[i].amount == 0) revert ZeroAmount();
-            total += burns[i].amount;
+            bytes32 mr = burns[i].mintRecipient;
+            bytes32 dc = burns[i].destinationCaller;
+            bool isVaultDeposit = (mr == selfB && dc == selfB);
+            bool isDirectMint   = (mr == senderB && dc == bytes32(0));
+            if (!isVaultDeposit && !isDirectMint) revert InvalidInput();
+            burnTotal += burns[i].amount;
         }
 
         // Pull total USDC from msg.sender in one transfer
-        usdc.safeTransferFrom(msg.sender, address(this), total);
+        uint256 before = usdc.balanceOf(address(this));
+        usdc.safeTransferFrom(msg.sender, address(this), localTotal + burnTotal);
 
         // Deposit into each local vault
         for (uint256 i = 0; i < vaults.length; i++) {
@@ -696,14 +794,23 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
             emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
         }
 
-        // Execute CCTP burns for cross-chain deposits
+        // Execute CCTP burns for cross-chain deposits (hookData = msg.sender).
+        // Single approval before the loop covers all burns in this batch.
+        if (burns.length > 0) usdc.forceApprove(tokenMessenger, burnTotal);
         for (uint256 i = 0; i < burns.length; i++) {
             _cctpBurn(burns[i].amount, burns[i].destDomain,
-                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold);
+                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
+                msg.sender);
             emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
         }
 
-        emit StrategyCreated(msg.sender, total);
+        // Return any remainder to the user
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) {
+            usdc.safeTransfer(msg.sender, remainder);
+        }
+
+        emit StrategyCreated(msg.sender, localTotal + burnTotal);
     }
 
     // -------------------------------------------------------------------------
@@ -721,7 +828,7 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
     ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
-    /// @param vaults     ERC4626 vault addresses to withdraw from. Each must be whitelisted.
+    /// @param vaults     ERC4626 vault addresses to withdraw from.
     /// @param shares     Gross share amounts per vault (0 = full balance).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
     /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
@@ -734,9 +841,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     ) external nonReentrant {
         if (vaults.length == 0 || shares.length != vaults.length) revert InvalidInput();
         if (feeAmounts.length != vaults.length) revert ArrayLengthMismatch();
-        // type(uint256).max sentinel ("burn all") is only valid in the final burn entry
-        for (uint256 i = 0; i + 1 < burns.length; i++) {
-            if (burns[i].amount == type(uint256).max) revert InvalidInput();
+        // Per-burn pairing: (msg.sender, 0) — permissionless bridge-back to the
+        // caller's wallet. type(uint256).max ("burn all") only valid in the final entry.
+        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
+        for (uint256 i = 0; i < burns.length; i++) {
+            if (i + 1 < burns.length && burns[i].amount == type(uint256).max) revert InvalidInput();
+            if (burns[i].mintRecipient != senderB || burns[i].destinationCaller != bytes32(0)) revert InvalidInput();
         }
 
         // When burns are present, USDC goes to the contract first (for CCTP burn).
@@ -751,10 +861,12 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
 
         for (uint256 i = 0; i < vaults.length; i++) {
             address vault = vaults[i];
-            if (!approvedVaults[vault]) revert VaultNotApproved(vault);
 
-            uint256 amt = shares[i] > 0 ? shares[i] : IERC20(vault).balanceOf(msg.sender);
-            if (amt == 0) continue;
+            // L-06: the (shares[i] == 0 → full balance) sentinel was removed; callers must
+            // pass the explicit gross share amount. This closes the max-approval footgun
+            // where a zero entry would silently drain the user's full balance from `vault`.
+            if (shares[i] == 0) revert ZeroAmount();
+            uint256 amt = shares[i];
             IERC20(vault).safeTransferFrom(msg.sender, address(this), amt);
             uint256 feeAmt = feeAmounts[i];
             if (feeAmt > 0) {
@@ -778,22 +890,59 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
         // Execute CCTP burns for cross-chain bridge-back
         if (hasBurns) {
             uint256 netUsdc = usdc.balanceOf(address(this)) - preBalance;
+            usdc.forceApprove(tokenMessenger, netUsdc);
 
             for (uint256 i = 0; i < burns.length; i++) {
                 uint256 burnAmount = burns[i].amount == type(uint256).max ? netUsdc : burns[i].amount;
                 if (burnAmount > netUsdc) revert InvalidInput();
 
                 _cctpBurn(burnAmount, burns[i].destDomain,
-                    burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold);
+                    burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
+                    msg.sender);
                 emit BridgeBurnInitiated(msg.sender, burnAmount, burns[i].destDomain, burns[i].mintRecipient);
                 netUsdc -= burnAmount;
             }
+
+            usdc.forceApprove(tokenMessenger, 0);
 
             // Send any remainder to the user
             if (netUsdc > 0) {
                 usdc.safeTransfer(msg.sender, netUsdc);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // User-callable: CCTP escape hatch
+    // -------------------------------------------------------------------------
+
+    /// @notice Consume a pending CCTP V2 message and deliver the minted USDC straight
+    ///         to the beneficiary's wallet, bypassing the vault deposit. Use when the
+    ///         relayer cannot complete `relayAndDeposit` (relayer down, beneficiary
+    ///         has no destination-vault allowance, etc.).
+    /// @dev Authorization is via the hookData beneficiary committed at burn time
+    ///      (encoded by `_cctpBurn`, validated by `relayAndDeposit`). Only callable by
+    ///      that beneficiary on the destination chain. Works because this contract is
+    ///      the `destinationCaller` per the L-02 pairing constraint for the
+    ///      `(this, this)` case.
+    /// @param message     Raw CCTP V2 message bytes from Circle's Iris API.
+    /// @param attestation Circle attestation signature authorising the relay.
+    function emergencyClaimBridge(
+        bytes calldata message,
+        bytes calldata attestation
+    ) external nonReentrant {
+        if (message.length < 408) revert InvalidInput();
+        address beneficiary = abi.decode(message[376:408], (address));
+        if (msg.sender != beneficiary) revert Unauthorized();
+
+        uint256 before = usdc.balanceOf(address(this));
+        bool ok = IMessageTransmitter(messageTransmitter).receiveMessage(message, attestation);
+        if (!ok) revert MessageRelayFailed();
+
+        uint256 minted = usdc.balanceOf(address(this)) - before;
+        usdc.safeTransfer(beneficiary, minted);
+
+        emit BridgeClaimed(beneficiary, minted);
     }
 
     // -------------------------------------------------------------------------
@@ -818,13 +967,23 @@ contract QuicknodeEarnProxy is Initializable, Ownable2Step, ReentrancyGuard, UUP
     /// @notice Return the full list of currently whitelisted vault addresses.
     /// @return Array of approved vault addresses.
     function getApprovedVaults() external view returns (address[] memory) {
-        return vaultList;
+        return _getEarnStorage().vaultList;
     }
 
     /// @notice Check whether a specific vault address is currently whitelisted.
     /// @param vault The address to query.
     /// @return True if the vault is approved, false otherwise.
     function isVaultApproved(address vault) external view returns (bool) {
-        return approvedVaults[vault];
+        return _getEarnStorage().approvedVaults[vault];
+    }
+
+    /// @notice The executor address permitted to call `rebalance` and `withdrawAndBridge`.
+    function executor() external view returns (address) {
+        return _getEarnStorage().executor;
+    }
+
+    /// @notice The relayer address permitted to call `relayAndDeposit`.
+    function relayer() external view returns (address) {
+        return _getEarnStorage().relayer;
     }
 }
