@@ -32,9 +32,9 @@ The active proxy is deployed at the same address on every supported chain via Cr
 
 Per-chain implementation addresses, vault whitelists, and the deploy/upgrade runbook live in the operator repo:
 
-- [`docs/contracts/multichain-deployments.md`](../docs/contracts/multichain-deployments.md) — live state
-- [`docs/contracts/deployment-runbook.md`](../docs/contracts/deployment-runbook.md) — deploy & UUPS upgrade workflow
-- [`docs/contracts/contract-verification.md`](../docs/contracts/contract-verification.md) — Etherscan V2 verification
+- [`docs-internal/contracts/multichain-deployments.md`](../docs-internal/contracts/multichain-deployments.md) — live state
+- [`docs-internal/contracts/deployment-runbook.md`](../docs-internal/contracts/deployment-runbook.md) — deploy & UUPS upgrade workflow
+- [`docs-internal/contracts/contract-verification.md`](../docs-internal/contracts/contract-verification.md) — Etherscan V2 verification
 
 ## Build & test
 
