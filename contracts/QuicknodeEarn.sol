@@ -781,13 +781,16 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///      withholds `feeAmounts[i]` shares as a performance fee and redeems
     ///      the remainder to msg.sender as USDC.
     ///      `feeAmounts[i]` must be < `shares[i]`. Pass 0 for vaults with no fee.
-    ///      Vaults where the effective amount resolves to zero are silently skipped.
+    ///      Each `shares[i]` must be an explicit, non-zero gross amount; passing 0 reverts
+    ///      with `ZeroAmount` (the "0 = full balance" sentinel was removed per audit L-06).
     ///      When `burns` is non-empty, redeemed USDC is accumulated in the contract and
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
     ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
-    /// @param vaults     ERC4626 vault addresses to withdraw from. Each must be whitelisted.
-    /// @param shares     Gross share amounts per vault (0 = full balance).
+    /// @param vaults     ERC4626 vault addresses to withdraw from. Source-side vaults are
+    ///                   intentionally not whitelist-checked, so a user can always exit a
+    ///                   position even if the vault is later delisted.
+    /// @param shares     Gross share amounts per vault. Each must be > 0 (0 reverts).
     /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
     /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
     ///                   May be empty for single-chain withdrawals.
