@@ -55,6 +55,72 @@ interface ITokenMessengerV2 {
     ) external;
 }
 
+/// @dev Minimal Uniswap Permit2 SignatureTransfer interface (canonical deployment).
+///      Used by `bridgePermit2` and `selfBatchDepositPermit2` to pull USDC with an
+///      off-chain EIP-712 signature instead of a per-call ERC20 approval.
+///      The absent return value on `permitTransferFrom` is load-bearing: Solidity
+///      emits the `extcodesize` existence check only when no return data is decoded,
+///      so on a chain without Permit2 the call reverts instead of silently
+///      succeeding. A silent success would let a caller reach the deposit and burn
+///      legs having transferred nothing. Do not add a return type.
+interface ISignatureTransfer {
+    struct TokenPermissions {
+        address token;
+        uint256 amount;
+    }
+    struct PermitTransferFrom {
+        TokenPermissions permitted;
+        uint256 nonce;
+        uint256 deadline;
+    }
+    struct SignatureTransferDetails {
+        address to;
+        uint256 requestedAmount;
+    }
+    /// @notice Transfer `transferDetails.requestedAmount` of `permit.permitted.token`
+    ///         from `owner` to `transferDetails.to`, authorised by `signature`.
+    ///         Permit2 itself enforces nonce uniqueness, deadline expiry, signature
+    ///         validity, and `requestedAmount <= permit.permitted.amount`.
+    /// @param permit         The token, amount, nonce and deadline the owner signed over.
+    /// @param transferDetails Recipient and the amount actually requested, which must not
+    ///                        exceed the signed amount.
+    /// @param owner          The account that signed the permit. Permit2 recovers an EOA
+    ///                       signature with ecrecover and verifies a contract signer via
+    ///                       EIP-1271, which is what lets multi-sig and ERC-4337 accounts
+    ///                       use these paths.
+    /// @param signature      EIP-712 signature, or the EIP-1271 blob for a contract signer.
+    function permitTransferFrom(
+        PermitTransferFrom calldata permit,
+        SignatureTransferDetails calldata transferDetails,
+        address owner,
+        bytes calldata signature
+    ) external;
+}
+
+/// @dev Minimal Morpho Vault V2 interface for force-deallocation.
+///      `forceDeallocate` is permissionless on the vault side: it moves `assets`
+///      from `adapter` back into the vault's idle balance so a subsequent redeem
+///      can succeed, and charges a curator-set penalty (protocol-capped at 2%)
+///      by burning vault shares from `onBehalf` through the vault's own public
+///      withdraw path. When the caller IS `onBehalf`, no share allowance is
+///      required for the penalty charge.
+interface IMorphoVaultV2 {
+    /// @notice Move `assets` out of `adapter` and back into the vault's idle balance so a
+    ///         subsequent redeem can be served, charging a penalty in vault shares.
+    /// @param adapter  Vault V2 adapter to deallocate from.
+    /// @param data     Adapter-specific market identifier: abi-encoded MarketParams
+    ///                 for MorphoMarketV1AdapterV2, empty bytes for MorphoVaultV1Adapter.
+    /// @param assets   Asset amount to move from the adapter into vault idle.
+    /// @param onBehalf Account whose shares pay the penalty.
+    /// @return penaltyShares Vault shares burned from `onBehalf` as the penalty.
+    function forceDeallocate(
+        address adapter,
+        bytes calldata data,
+        uint256 assets,
+        address onBehalf
+    ) external returns (uint256 penaltyShares);
+}
+
 /// @notice Parameters for a single CCTP V2 cross-chain burn within `selfBatchDeposit`
 ///         and `selfBatchWithdraw` (bridge-back on close).
 /// @dev All fields are value types so the struct is calldata-safe.
@@ -65,6 +131,20 @@ struct BridgeBurn {
     uint256 amount;               // USDC amount to burn for this destination
     uint256 maxFee;               // Maximum fee the CCTP protocol may charge (0 for standard)
     uint32  minFinalityThreshold; // 0 = fast finality (seconds), 2000 = standard finality (full chain finality)
+}
+
+/// @notice One force-deallocation instruction for a Morpho Vault V2 source vault,
+///         used by `rebalance` and `withdrawAndBridge`.
+/// @dev `data` identifies the underlying market to the adapter: abi-encoded
+///      MarketParams for MorphoMarketV1AdapterV2, empty bytes for
+///      MorphoVaultV1Adapter. The executor sizes `assets` off-chain to cover only
+///      the shortfall the vault's normal redeem path cannot serve (idle balance
+///      plus the vault's configured liquidityAdapter market, which redeem draws
+///      automatically and penalty-free).
+struct ForceDealloc {
+    address adapter; // Vault V2 adapter registered on the source vault
+    bytes   data;    // adapter-specific market identifier blob
+    uint256 assets;  // asset amount to deallocate from this adapter
 }
 
 /// @title QuicknodeEarn
@@ -79,11 +159,12 @@ struct BridgeBurn {
 ///        - **Relayer**: calls `relayAndDeposit` to relay CCTP messages and deposit.
 ///      - Users can create strategies via `selfBatchDeposit` and close them via
 ///        `selfBatchWithdraw` without owner involvement.
-///      - Fee model: a performance fee is collected as vault shares (not USDC). The executor
-///        computes 15% of yield earned across ALL strategy vaults, converts each to vault
-///        shares, and passes them as `feeVaults[]`/`feeAmounts[]` on rebalance/withdraw
-///        calls. The contract transfers those shares from the user to itself. The owner
-///        sweeps accumulated fee tokens via `sweep()`.
+///      - Fee model: a rebalance fee is collected as vault shares (not USDC). The executor
+///        computes the fee off-chain (gas-cost-plus: the move's gas cost in USDC times a
+///        per-chain multiplier), converts it to vault shares, and passes them as
+///        `feeVaults[]`/`feeAmounts[]` on rebalance/withdraw calls. The contract transfers
+///        those shares from the user to itself. The owner sweeps accumulated fee tokens
+///        via `sweep()`.
 ///        Fee arrays may be empty (no-fee rebalance) or contain vaults unrelated to the
 ///        current `fromVault`/`toVault` pair — the executor collects from ALL vaults with
 ///        accrued yield in a single operation.
@@ -95,12 +176,56 @@ struct BridgeBurn {
 ///        vault withdrawal; `relayAndDeposit` relays a CCTP message and atomically
 ///        deposits on the destination chain; `selfBatchDeposit` and `selfBatchWithdraw`
 ///        accept optional `BridgeBurn[]` arrays for cross-chain deposits and bridge-back
-///        on close.
-///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable
-///        with no owner requirement, providing a trustless exit path independent of
-///        the rebalancer.
+///        on close; `bridge` and `bridgePermit2` are standalone wallet-to-wallet
+///        transfers unrelated to any vault position.
+///      - Morpho Vault V2 force-deallocation: a V2 vault usually holds almost no idle
+///        USDC, so a plain redeem can fail even though the underlying liquidity is
+///        recoverable. `rebalance`, `withdrawAndBridge` and `selfBatchWithdraw` accept
+///        an optional `ForceDealloc[]` that frees adapter liquidity first, for a
+///        penalty the vault charges against the position being moved. See
+///        `_forceDeallocate` for the penalty accounting and its two caps.
+///      - Permit2: `bridgePermit2` and `selfBatchDepositPermit2` pull USDC with an
+///        off-chain EIP-712 signature instead of a per-call ERC20 approval. Permit2
+///        verifies contract signers through EIP-1271, so multi-sig and ERC-4337
+///        accounts work on these paths as well as EOAs.
+///      - `selfBatchDeposit` and `selfBatchWithdraw` are deliberately user-callable with
+///        no owner requirement. Note that they are a convenience, not the source of the
+///        exit guarantee: vault shares live in the user's own wallet, so a user can
+///        always redeem directly against the vault (calling Morpho's permissionless
+///        `forceDeallocate` first if it is illiquid) without touching this contract.
 contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
+
+    /// @notice Canonical Permit2 deployment address (same on all EVM chains).
+    address public constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
+    /// @notice Hard ceiling on the force-deallocate penalty, in basis points of the
+    ///         shares being moved. Morpho caps a vault's own penalty at 2% of the
+    ///         DEALLOCATED assets, and a legitimate deallocation never exceeds the
+    ///         position being moved, so an honest move stays under 2%. The extra
+    ///         headroom absorbs rounding. This bound is what limits the damage a
+    ///         compromised executor can do: without it, the only on-chain limit
+    ///         would be the caller-supplied `maxPenaltyShares`, which is set by the
+    ///         same actor that supplies the deallocation instructions.
+    uint256 public constant MAX_FORCE_DEALLOC_PENALTY_BPS = 300;
+
+    /// @notice Implementation version, incremented on each upgrade. Lets an
+    ///         off-chain caller detect which ABI a given chain expects during a
+    ///         staged multi-chain rollout.
+    uint256 public constant VERSION = 2;
+
+    /// @notice `service` value meaning the caller will complete the destination
+    ///         mint themselves. Every standalone burn uses a zero destination
+    ///         caller, so the caller (or any third party) can always relay.
+    uint8 public constant BRIDGE_SELF_RELAY = 0;
+
+    /// @notice `service` value meaning we are expected to complete the destination
+    ///         mint on the caller's behalf. The contract does NOT price this: it
+    ///         records what was paid and leaves the decision to relay to the
+    ///         off-chain quote, so pricing can change without a contract upgrade.
+    ///         An underpaid request is simply not relayed; the caller can still
+    ///         self-relay, so no funds are ever at risk.
+    uint8 public constant BRIDGE_SPONSORED_RELAY = 1;
 
     // -------------------------------------------------------------------------
     // State
@@ -264,6 +389,52 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         bytes32 mintRecipient
     );
 
+    /// @notice Emitted when an executor force-dealloc call moved liquidity out of a
+    ///         Morpho Vault V2 source vault before the redeem.
+    /// @param user              The user whose position bears the penalty (as a reduced redeem).
+    /// @param vault             The Vault V2 that was force-deallocated.
+    /// @param assetsDeallocated Total assets moved from adapters into vault idle.
+    /// @param penaltyShares     Total vault shares burned as the penalty.
+    event ForceDeallocated(
+        address indexed user,
+        address indexed vault,
+        uint256 assetsDeallocated,
+        uint256 penaltyShares
+    );
+
+    /// @notice Emitted for every standalone bridge. This is the ONLY event the
+    ///         standalone path emits, deliberately: `BridgeBurnInitiated` denotes
+    ///         strategy activity and the event-processor attributes it to a
+    ///         strategy, so reusing it here would misclassify a plain transfer.
+    /// @dev Carries every field an indexer needs to act without decoding
+    ///      calldata. That matters because a smart-account (ERC-4337 / multi-sig)
+    ///      transaction wraps our call, and the outer calldata is not decodable,
+    ///      so anything readable only from calldata would be unknowable for those
+    ///      users. Emitted unconditionally, including when `fee` is zero.
+    /// @param user                 The account that bridged (EOA, multi-sig, or 4337 account).
+    /// @param service              Who is expected to complete the destination mint:
+    ///                             `BRIDGE_SELF_RELAY` (0) means the user claims it themselves,
+    ///                             `BRIDGE_SPONSORED_RELAY` (1) means we relay it for them.
+    ///                             Indexed so an indexer can filter cheaply.
+    /// @param fee                  USDC retained by this contract.
+    /// @param amount               USDC burned via CCTP, after `fee` is deducted. Circle may
+    ///                             deduct up to `maxFee` again on the destination chain, so the
+    ///                             recipient can receive less than this.
+    /// @param destDomain           CCTP destination domain ID.
+    /// @param mintRecipient        Address receiving the minted USDC on the destination chain.
+    /// @param maxFee               Circle's fee cap. Zero on a standard transfer.
+    /// @param minFinalityThreshold 2000 = standard, 1000 or lower = Circle Fast Transfer.
+    event BridgeExecuted(
+        address indexed user,
+        uint8   indexed service,
+        uint256 fee,
+        uint256 amount,
+        uint32  destDomain,
+        address mintRecipient,
+        uint256 maxFee,
+        uint32  minFinalityThreshold
+    );
+
     // -------------------------------------------------------------------------
     // Errors
     // -------------------------------------------------------------------------
@@ -303,6 +474,15 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     /// @notice Thrown when `emergencyClaimBridge` is called by an address other than the
     ///         hookData beneficiary committed at burn time.
     error Unauthorized();
+
+    /// @notice Thrown when the cumulative force-deallocate penalty exceeds either the
+    ///         caller-supplied cap or the contract's own `MAX_FORCE_DEALLOC_PENALTY_BPS`
+    ///         ceiling. The caller-supplied cap guards against a curator repricing the
+    ///         vault penalty between off-chain simulation and on-chain inclusion; the
+    ///         constant ceiling guards the position holder against the caller itself.
+    /// @param penaltyShares Cumulative penalty shares charged by the vault.
+    /// @param cap           The lower of the two caps that was breached.
+    error PenaltyTooHigh(uint256 penaltyShares, uint256 cap);
 
     /// @notice Emitted when a user claims a bridged CCTP burn directly via
     ///         `emergencyClaimBridge`, bypassing the relayer.
@@ -465,10 +645,152 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (sharesReceived == 0) revert ZeroAmount();
     }
 
-    /// @dev Pull ERC4626 vault shares from `user` and redeem to USDC held by this contract.
-    function _withdrawFromVault(address vault, address user, uint256 shares) private returns (uint256 usdcReceived) {
+    /// @dev Pull ERC4626 vault shares from `user`, force-deallocate liquidity from
+    ///      the vault's adapters into its idle balance. The shares being moved must
+    ///      ALREADY be held by this contract: the penalty is charged with
+    ///      `onBehalf = address(this)`, so it burns from the shares in motion and
+    ///      never touches the position holder's wallet balance or allowances.
+    /// @dev  Two independent caps apply. `maxPenaltyShares` is supplied by the caller
+    ///       and protects the caller against a curator repricing the penalty between
+    ///       simulation and inclusion. `MAX_FORCE_DEALLOC_PENALTY_BPS` is a constant
+    ///       and protects the position holder against the caller, which matters
+    ///       because the same actor supplies both the deallocation sizes and their cap.
+    ///       Callers must subtract the returned penalty from the amount they redeem.
+    /// @param vault            The Morpho Vault V2 to deallocate from.
+    /// @param deallocs         Force-deallocation instructions (may be empty).
+    /// @param shares           Shares being moved; the penalty ceiling is a fraction of this.
+    /// @param maxPenaltyShares Caller's cap on cumulative penalty shares.
+    /// @param holder           Position holder, for the event only.
+    /// @return penaltyShares   Vault shares burned from this contract as the penalty.
+    function _forceDeallocate(
+        address vault,
+        ForceDealloc[] calldata deallocs,
+        uint256 shares,
+        uint256 maxPenaltyShares,
+        address holder
+    ) private returns (uint256 penaltyShares) {
+        if (deallocs.length == 0) return 0;
+
+        uint256 assetsTotal = 0;
+        for (uint256 i = 0; i < deallocs.length; i++) {
+            if (deallocs[i].assets == 0) revert ZeroAmount();
+            assetsTotal += deallocs[i].assets;
+            penaltyShares += IMorphoVaultV2(vault).forceDeallocate(
+                deallocs[i].adapter,
+                deallocs[i].data,
+                deallocs[i].assets,
+                address(this)
+            );
+        }
+        if (penaltyShares > maxPenaltyShares) revert PenaltyTooHigh(penaltyShares, maxPenaltyShares);
+        uint256 ceiling = shares * MAX_FORCE_DEALLOC_PENALTY_BPS / 10_000;
+        if (penaltyShares > ceiling) revert PenaltyTooHigh(penaltyShares, ceiling);
+
+        emit ForceDeallocated(holder, vault, assetsTotal, penaltyShares);
+    }
+
+    /// @dev Pull ERC4626 vault shares from `user`, optionally force-deallocate
+    ///      liquidity from the vault's adapters, then redeem the pulled shares net
+    ///      of the penalty. See `_forceDeallocate` for the penalty accounting.
+    ///      `usdcReceived` is the MEASURED balance increase, not the vault's reported
+    ///      redeem return: a vault that over-reports must not be able to make callers
+    ///      spend USDC the contract already holds.
+    /// @param vault            The vault to withdraw from.
+    /// @param user             The user whose shares are pulled (and who bears the penalty).
+    /// @param shares           Gross ERC4626 shares to pull from `user`.
+    /// @param deallocs         Force-deallocation instructions (may be empty).
+    /// @param maxPenaltyShares Cap on cumulative penalty shares; exceeding it reverts.
+    /// @return usdcReceived    USDC actually received by this contract.
+    function _withdrawFromVault(
+        address vault,
+        address user,
+        uint256 shares,
+        ForceDealloc[] calldata deallocs,
+        uint256 maxPenaltyShares
+    ) private returns (uint256 usdcReceived) {
         IERC20(vault).safeTransferFrom(user, address(this), shares);
-        usdcReceived = IERC4626(vault).redeem(shares, address(this), address(this));
+
+        uint256 penaltyShares = _forceDeallocate(vault, deallocs, shares, maxPenaltyShares, user);
+
+        uint256 before = usdc.balanceOf(address(this));
+        IERC4626(vault).redeem(shares - penaltyShares, address(this), address(this));
+        usdcReceived = usdc.balanceOf(address(this)) - before;
+    }
+
+    /// @dev Pull `amount` USDC from msg.sender into this contract via a Permit2
+    ///      SignatureTransfer. The signed token is REQUIRED to be USDC: without
+    ///      this check a caller could satisfy the pull with a worthless token
+    ///      while the subsequent deposits/burns spend USDC already resting in the
+    ///      contract (accumulated bridge fees).
+    function _permit2Pull(
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature,
+        uint256 amount
+    ) private {
+        if (permit.permitted.token != address(usdc)) revert InvalidInput();
+        ISignatureTransfer(PERMIT2).permitTransferFrom(
+            permit,
+            ISignatureTransfer.SignatureTransferDetails({ to: address(this), requestedAmount: amount }),
+            msg.sender,
+            signature
+        );
+    }
+
+    /// @dev Shared validation for both bridge entry points. Runs BEFORE any funds
+    ///      move, so a bad request never reaches an external transfer.
+    function _validateBridge(
+        uint256 amount,
+        uint256 fee,
+        uint8   service,
+        address mintRecipient
+    ) private view {
+        if (tokenMessenger == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (fee >= amount) revert InvalidInput();
+        if (service > BRIDGE_SPONSORED_RELAY) revert InvalidInput();
+        if (mintRecipient == address(0)) revert ZeroAddress();
+        // A standalone bridge must not mint into this contract: the proxy sits at
+        // the same address on every chain, so a self-recipient burn would park USDC
+        // in the destination contract with no vault intent attached. Cross-chain
+        // vault deposits have their own path via `selfBatchDeposit` burns.
+        if (mintRecipient == address(this)) revert InvalidInput();
+    }
+
+    /// @dev Shared tail of `bridge` / `bridgePermit2`: retain `fee` USDC, burn the
+    ///      remainder via CCTP with `mintRecipient` on the destination chain and no
+    ///      destination caller, so anyone may relay and the mint always lands in the
+    ///      recipient's wallet. `mintRecipient` is taken as an `address` and padded
+    ///      here: CCTP truncates a bytes32 recipient to its low 20 bytes, so
+    ///      accepting bytes32 from the caller would let a padded value defeat the
+    ///      self-address check below.
+    ///      The fee rests in the contract as USDC until the owner sweeps it.
+    function _bridgeBurnWithFee(
+        uint256 amount,
+        uint256 fee,
+        uint8   service,
+        uint32  destDomain,
+        address mintRecipient,
+        uint256 maxFee,
+        uint32  minFinalityThreshold
+    ) private {
+        uint256 bridgeAmount = amount - fee;
+
+        usdc.forceApprove(tokenMessenger, bridgeAmount);
+        _cctpBurn(
+            bridgeAmount,
+            destDomain,
+            bytes32(uint256(uint160(mintRecipient))),
+            bytes32(0),
+            maxFee,
+            minFinalityThreshold,
+            msg.sender
+        );
+        usdc.forceApprove(tokenMessenger, 0);
+
+        emit BridgeExecuted(
+            msg.sender, service, fee, bridgeAmount,
+            destDomain, mintRecipient, maxFee, minFinalityThreshold
+        );
     }
 
     /// @dev Burn USDC cross-chain via CCTP V2 TokenMessenger using `depositForBurnWithHook`.
@@ -487,8 +809,8 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (tokenMessenger == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (mintRecipient == bytes32(0)) revert ZeroAddress();
-        // Approval is now hoisted to each call site (selfBatchDeposit, selfBatchWithdraw,
-        // withdrawAndBridge) so a batch of burns issues a single forceApprove instead of N.
+        // Callers must approve `tokenMessenger` before calling: the approval is hoisted
+        // to each call site so a batch of burns issues one approval, not one per burn.
         (bool success, ) = tokenMessenger.call(
             abi.encodeCall(
                 ITokenMessengerV2.depositForBurnWithHook,
@@ -506,25 +828,39 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     /// @notice Atomically move a user's position from one vault to another.
     /// @dev Flow:
     ///      1. Collect performance fee shares from user (may span multiple vaults).
-    ///      2. Pull `shares` from `fromVault` and redeem to USDC.
+    ///      2. Pull `shares` from `fromVault`, execute each `ForceDealloc` with
+    ///         `onBehalf = address(this)` (the penalty burns from the pulled shares,
+    ///         never from the user's wallet or allowances), then redeem
+    ///         `shares - penaltyShares` to USDC. Pass an empty `deallocs` array on
+    ///         liquid vaults; the flow is then a plain pull-and-redeem.
     ///      3. Deposit full USDC amount into `toVault` on behalf of `user`.
     ///      Pass empty arrays for `feeVaults`/`feeAmounts` to perform a no-fee rebalance.
     ///      The user must have pre-approved this contract to spend their `fromVault`
     ///      ERC4626 shares and any fee vault tokens before the rebalancer calls this.
     /// @param user       The user whose position is being rebalanced.
-    /// @param fromVault  The vault to withdraw from. Must be whitelisted.
+    /// @param fromVault  The vault to withdraw from. Deliberately NOT checked against
+    ///                   `approvedVaults`, so a position stays exitable after the vault
+    ///                   is de-listed (OZ audit finding #7).
     /// @param toVault    The vault to deposit into. Must be whitelisted.
     /// @param shares     ERC4626 shares to move.
     /// @param feeVaults  Vault addresses from which to collect performance fee shares.
     ///                   May be empty (no fee) or contain vaults outside the rebalance pair.
     /// @param feeAmounts Corresponding share amounts to collect from each vault in `feeVaults`.
+    /// @param deallocs   Force-deallocation instructions for `fromVault`'s adapters
+    ///                   (Morpho Vault V2 only). Empty when the vault's liquid
+    ///                   capacity covers the move.
+    /// @param maxPenaltyShares Cap on cumulative penalty shares charged by the vault.
+    ///                   A curator repricing the penalty between simulation and
+    ///                   inclusion makes the call revert instead of overcharging.
     function rebalance(
         address user,
         address fromVault,
         address toVault,
         uint256 shares,
         address[] calldata feeVaults,
-        uint256[] calldata feeAmounts
+        uint256[] calldata feeAmounts,
+        ForceDealloc[] calldata deallocs,
+        uint256 maxPenaltyShares
     ) external onlyExecutor nonReentrant {
         if (shares == 0) revert ZeroAmount();
         if (fromVault == toVault) revert InvalidInput();
@@ -537,7 +873,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
 
         // --- Withdrawal leg ---
         uint256 before = usdc.balanceOf(address(this));
-        uint256 usdcReceived = _withdrawFromVault(fromVault, user, shares);
+        uint256 usdcReceived = _withdrawFromVault(fromVault, user, shares, deallocs, maxPenaltyShares);
 
         // --- Deposit leg (full amount — fees already taken as shares) ---
         _depositToVault(toVault, usdcReceived, user);
@@ -566,8 +902,12 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///      chain means only _this_ contract can relay, which prevents MEV bots from
     ///      front-running the relay and stealing the minted USDC.
     ///      Performance fees are collected as vault shares before the withdrawal.
+    ///      Force-dealloc semantics match `rebalance`: pass an empty `deallocs`
+    ///      array when the vault's liquid capacity covers the redeem.
     /// @param user                  The user whose vault position is bridged.
-    /// @param vault                 The vault to withdraw from. Must be whitelisted.
+    /// @param vault                 The vault to withdraw from. Deliberately NOT checked
+    ///                              against `approvedVaults`, so a position stays exitable
+    ///                              after the vault is de-listed (OZ audit finding #7).
     /// @param shares                ERC4626 shares to redeem.
     /// @param feeVaults             Vault addresses from which to collect performance fee shares.
     /// @param feeAmounts            Corresponding share amounts to collect from each vault in `feeVaults`.
@@ -577,6 +917,9 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///                              Set to `address(0)` to allow anyone to relay (no MEV protection).
     /// @param maxFee                Maximum fee the CCTP protocol may charge (0 for standard).
     /// @param minFinalityThreshold  0 = fast finality (seconds), 2000 = standard finality (full chain finality).
+    /// @param deallocs              Force-deallocation instructions for `vault`'s adapters
+    ///                              (Morpho Vault V2 only). Empty when the vault is liquid.
+    /// @param maxPenaltyShares      Cap on cumulative penalty shares charged by the vault.
     /// @return netUsdc              USDC burned via CCTP.
     function withdrawAndBridge(
         address user,
@@ -588,7 +931,9 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         bytes32 mintRecipient,
         bytes32 destinationCaller,
         uint256 maxFee,
-        uint32  minFinalityThreshold
+        uint32  minFinalityThreshold,
+        ForceDealloc[] calldata deallocs,
+        uint256 maxPenaltyShares
     ) external onlyExecutor nonReentrant returns (uint256 netUsdc) {
         if (shares == 0) revert ZeroAmount();
         if (feeVaults.length != feeAmounts.length) revert ArrayLengthMismatch();
@@ -609,7 +954,7 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         _collectFees(user, feeVaults, feeAmounts);
 
         // --- Withdrawal ---
-        netUsdc = _withdrawFromVault(vault, user, shares);
+        netUsdc = _withdrawFromVault(vault, user, shares, deallocs, maxPenaltyShares);
 
         // --- CCTP burn (hookData = user, verified by relayAndDeposit on dest chain) ---
         usdc.forceApprove(tokenMessenger, netUsdc);
@@ -663,14 +1008,11 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
             if (IERC20(vaults[i]).allowance(user, address(this)) == 0) revert InvalidInput();
         }
 
-        // Step 1: Snapshot USDC balance before relay
         uint256 before = usdc.balanceOf(address(this));
 
-        // Step 2: Relay the CCTP message — USDC minted to this contract
         bool success = IMessageTransmitter(messageTransmitter).receiveMessage(message, attestation);
         if (!success) revert MessageRelayFailed();
 
-        // Step 3: Verify minted amount covers all allocations
         uint256 minted = usdc.balanceOf(address(this)) - before;
         uint256 totalNeeded = 0;
         for (uint256 i = 0; i < amounts.length; i++) {
@@ -678,17 +1020,85 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         }
         if (minted < totalNeeded) revert ZeroAmount();
 
-        // Step 4: Deposit into each vault on behalf of user
         for (uint256 i = 0; i < vaults.length; i++) {
             uint256 sharesReceived = _depositToVault(vaults[i], amounts[i], user);
             emit DepositedFromBridge(user, vaults[i], amounts[i], sharesReceived);
         }
 
-        // Step 5: Return any remainder to the user (e.g. CCTP fee buffer)
+        // Remainder covers the CCTP fee buffer.
         uint256 remainder = usdc.balanceOf(address(this)) - before;
         if (remainder > 0) {
             usdc.safeTransfer(user, remainder);
         }
+    }
+
+    /// @dev Validate a batch-deposit request and total the USDC it needs. Also
+    ///      returns this contract's USDC balance BEFORE any pull, so the caller's
+    ///      remainder calculation is a measured delta and can never reach USDC
+    ///      already resting here.
+    /// @return localTotal Sum of `amounts`, deposited into local vaults.
+    /// @return burnTotal  Sum of `burns[i].amount`, burned via CCTP.
+    /// @return before     USDC held by this contract before the pull.
+    function _validateBatchDeposit(
+        address[] calldata vaults,
+        uint256[] calldata amounts,
+        BridgeBurn[] calldata burns
+    ) private view returns (uint256 localTotal, uint256 burnTotal, uint256 before) {
+        if (vaults.length != amounts.length) revert InvalidInput();
+        if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
+
+        for (uint256 i = 0; i < vaults.length; i++) {
+            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
+            if (amounts[i] == 0) revert ZeroAmount();
+            localTotal += amounts[i];
+        }
+        // Per-burn allowed pairings:
+        //   (this, this)    — MEV-protected vault deposit on dest chain via relayAndDeposit.
+        //   (msg.sender, 0) — permissionless mint back to caller's wallet on dest chain.
+        bytes32 selfB = bytes32(uint256(uint160(address(this))));
+        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
+        for (uint256 i = 0; i < burns.length; i++) {
+            if (burns[i].amount == 0) revert ZeroAmount();
+            bytes32 mr = burns[i].mintRecipient;
+            bytes32 dc = burns[i].destinationCaller;
+            bool isVaultDeposit = (mr == selfB && dc == selfB);
+            bool isDirectMint   = (mr == senderB && dc == bytes32(0));
+            if (!isVaultDeposit && !isDirectMint) revert InvalidInput();
+            burnTotal += burns[i].amount;
+        }
+        before = usdc.balanceOf(address(this));
+    }
+
+    /// @dev Deposit and burn legs shared by both batch-deposit entry points. The
+    ///      USDC must already have been pulled in by the caller; only the pull
+    ///      mechanism differs between them.
+    function _executeBatchDeposit(
+        address[] calldata vaults,
+        uint256[] calldata amounts,
+        BridgeBurn[] calldata burns,
+        uint256 localTotal,
+        uint256 burnTotal,
+        uint256 before
+    ) private {
+        for (uint256 i = 0; i < vaults.length; i++) {
+            uint256 sharesReceived = _depositToVault(vaults[i], amounts[i], msg.sender);
+            emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
+        }
+
+        // hookData = msg.sender. A single approval covers every burn in the batch.
+        if (burns.length > 0) usdc.forceApprove(tokenMessenger, burnTotal);
+        for (uint256 i = 0; i < burns.length; i++) {
+            _cctpBurn(burns[i].amount, burns[i].destDomain,
+                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
+                msg.sender);
+            emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
+        }
+        if (burns.length > 0) usdc.forceApprove(tokenMessenger, 0);
+
+        uint256 remainder = usdc.balanceOf(address(this)) - before;
+        if (remainder > 0) usdc.safeTransfer(msg.sender, remainder);
+
+        emit StrategyCreated(msg.sender, localTotal + burnTotal);
     }
 
     // -------------------------------------------------------------------------
@@ -716,59 +1126,39 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         uint256[] calldata amounts,
         BridgeBurn[] calldata burns
     ) external nonReentrant {
-        if (vaults.length != amounts.length) revert InvalidInput();
-        if (vaults.length == 0 && burns.length == 0) revert InvalidInput();
-
-        // Validate all vaults and compute total USDC needed
-        uint256 localTotal = 0;
-        for (uint256 i = 0; i < vaults.length; i++) {
-            if (!approvedVaults[vaults[i]]) revert VaultNotApproved(vaults[i]);
-            if (amounts[i] == 0) revert ZeroAmount();
-            localTotal += amounts[i];
-        }
-        // Per-burn allowed pairings:
-        //   (this, this)       — MEV-protected vault deposit on dest chain via relayAndDeposit.
-        //   (msg.sender, 0)    — permissionless mint back to caller's wallet on dest chain.
-        bytes32 selfB = bytes32(uint256(uint160(address(this))));
-        bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
-        uint256 burnTotal = 0;
-        for (uint256 i = 0; i < burns.length; i++) {
-            if (burns[i].amount == 0) revert ZeroAmount();
-            bytes32 mr = burns[i].mintRecipient;
-            bytes32 dc = burns[i].destinationCaller;
-            bool isVaultDeposit = (mr == selfB && dc == selfB);
-            bool isDirectMint   = (mr == senderB && dc == bytes32(0));
-            if (!isVaultDeposit && !isDirectMint) revert InvalidInput();
-            burnTotal += burns[i].amount;
-        }
-
-        // Pull total USDC from msg.sender in one transfer
-        uint256 before = usdc.balanceOf(address(this));
+        (uint256 localTotal, uint256 burnTotal, uint256 before) =
+            _validateBatchDeposit(vaults, amounts, burns);
         usdc.safeTransferFrom(msg.sender, address(this), localTotal + burnTotal);
+        _executeBatchDeposit(vaults, amounts, burns, localTotal, burnTotal, before);
+    }
 
-        // Deposit into each local vault
-        for (uint256 i = 0; i < vaults.length; i++) {
-            uint256 sharesReceived = _depositToVault(vaults[i], amounts[i], msg.sender);
-            emit Deposited(msg.sender, vaults[i], amounts[i], sharesReceived);
-        }
-
-        // Execute CCTP burns for cross-chain deposits (hookData = msg.sender).
-        // Single approval before the loop covers all burns in this batch.
-        if (burns.length > 0) usdc.forceApprove(tokenMessenger, burnTotal);
-        for (uint256 i = 0; i < burns.length; i++) {
-            _cctpBurn(burns[i].amount, burns[i].destDomain,
-                burns[i].mintRecipient, burns[i].destinationCaller, burns[i].maxFee, burns[i].minFinalityThreshold,
-                msg.sender);
-            emit BridgeBurnInitiated(msg.sender, burns[i].amount, burns[i].destDomain, burns[i].mintRecipient);
-        }
-
-        // Return any remainder to the user
-        uint256 remainder = usdc.balanceOf(address(this)) - before;
-        if (remainder > 0) {
-            usdc.safeTransfer(msg.sender, remainder);
-        }
-
-        emit StrategyCreated(msg.sender, localTotal + burnTotal);
+    /// @notice Batch deposit into whitelisted vaults using a Permit2 signature for USDC.
+    /// @dev Identical to `selfBatchDeposit()` but pulls USDC via Uniswap's canonical
+    ///      Permit2 SignatureTransfer instead of a direct ERC20 `transferFrom`. The
+    ///      user must have approved USDC to the Permit2 contract once (`PERMIT2`);
+    ///      after that, every deposit is authorised purely by an off-chain EIP-712
+    ///      signature. Permit2 itself enforces nonce uniqueness, deadline expiry,
+    ///      and signature validity. The signed token MUST be USDC and the signed
+    ///      amount must cover `sum(amounts) + sum(burns[i].amount)`; a non-USDC
+    ///      token reverts (see `_permit2Pull`).
+    /// @param vaults    Ordered list of vault addresses on the source chain. Each must be
+    ///                  whitelisted. May be empty if all capital is bridged.
+    /// @param amounts   USDC amounts corresponding 1:1 with `vaults`. Each must be > 0.
+    /// @param burns     Array of CCTP burn parameters for cross-chain deposits.
+    ///                  May be empty for single-chain deposits.
+    /// @param permit    Permit2 `PermitTransferFrom` payload signed by msg.sender.
+    /// @param signature EIP-712 signature authorising the Permit2 transfer.
+    function selfBatchDepositPermit2(
+        address[] calldata vaults,
+        uint256[] calldata amounts,
+        BridgeBurn[] calldata burns,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external nonReentrant {
+        (uint256 localTotal, uint256 burnTotal, uint256 before) =
+            _validateBatchDeposit(vaults, amounts, burns);
+        _permit2Pull(permit, signature, localTotal + burnTotal);
+        _executeBatchDeposit(vaults, amounts, burns, localTotal, burnTotal, before);
     }
 
     // -------------------------------------------------------------------------
@@ -786,19 +1176,32 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///      burned via CCTP to bridge back to the user's source chain. Any remainder
     ///      after burns is transferred to msg.sender. Pass `type(uint256).max` as
     ///      `burns[i].amount` to burn all redeemed USDC (recommended for close flows).
-    /// @param vaults     ERC4626 vault addresses to withdraw from. Each must be whitelisted.
-    /// @param shares     Gross share amounts per vault (0 = full balance).
-    /// @param feeAmounts Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
-    /// @param burns      Array of CCTP burn parameters for cross-chain bridge-back.
-    ///                   May be empty for single-chain withdrawals.
+    ///      On a Morpho Vault V2 whose idle balance cannot cover the redeem, pass
+    ///      `deallocs[i]` to free liquidity from that vault's adapters first, so the
+    ///      exit does not depend on the executor. Pass empty outer arrays to skip
+    ///      force-deallocation entirely (the common case).
+    /// @param vaults           ERC4626 vault addresses to withdraw from.
+    /// @param shares           Gross share amounts per vault (0 reverts).
+    /// @param feeAmounts       Fee share amounts per vault, aligned with `vaults`. 0 = no fee.
+    /// @param burns            Array of CCTP burn parameters for cross-chain bridge-back.
+    ///                         May be empty for single-chain withdrawals.
+    /// @param deallocs         Per-vault force-deallocation instructions. Either empty, or
+    ///                         aligned 1:1 with `vaults` (inner arrays may be empty).
+    /// @param maxPenaltyShares Per-vault cap on penalty shares, aligned with `deallocs`.
     function selfBatchWithdraw(
         address[] calldata vaults,
         uint256[] calldata shares,
         uint256[] calldata feeAmounts,
-        BridgeBurn[] calldata burns
+        BridgeBurn[] calldata burns,
+        ForceDealloc[][] calldata deallocs,
+        uint256[] calldata maxPenaltyShares
     ) external nonReentrant {
         if (vaults.length == 0 || shares.length != vaults.length) revert InvalidInput();
         if (feeAmounts.length != vaults.length) revert ArrayLengthMismatch();
+        bool hasDeallocs = deallocs.length > 0;
+        if (hasDeallocs && (deallocs.length != vaults.length || maxPenaltyShares.length != vaults.length)) {
+            revert ArrayLengthMismatch();
+        }
         // Per-burn pairing: (msg.sender, 0) — permissionless bridge-back to the
         // caller's wallet. type(uint256).max ("burn all") only valid in the final entry.
         bytes32 senderB = bytes32(uint256(uint160(msg.sender)));
@@ -820,9 +1223,9 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         for (uint256 i = 0; i < vaults.length; i++) {
             address vault = vaults[i];
 
-            // L-06: the (shares[i] == 0 → full balance) sentinel was removed; callers must
-            // pass the explicit gross share amount. This closes the max-approval footgun
-            // where a zero entry would silently drain the user's full balance from `vault`.
+            // A zero share amount is rejected rather than treated as "full balance":
+            // an implicit sentinel would drain the whole position of any user holding
+            // a max approval.  (OZ audit finding L-06.)
             if (shares[i] == 0) revert ZeroAmount();
             uint256 amt = shares[i];
             IERC20(vault).safeTransferFrom(msg.sender, address(this), amt);
@@ -833,6 +1236,11 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
                 feeVaultsEmitted[feeCount] = vault;
                 feeAmountsEmitted[feeCount] = feeAmt;
                 feeCount++;
+            }
+            // Free adapter liquidity so an illiquid Vault V2 can still be exited.
+            // The penalty burns from the shares already pulled above.
+            if (hasDeallocs) {
+                amt -= _forceDeallocate(vault, deallocs[i], amt, maxPenaltyShares[i], msg.sender);
             }
             uint256 usdcReceived = IERC4626(vault).redeem(amt, usdcRecipient, address(this));
             emit StrategyExited(msg.sender, vault, amt, usdcReceived);
@@ -868,6 +1276,85 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
                 usdc.safeTransfer(msg.sender, netUsdc);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // User-callable: Standalone CCTP Bridge (caller-supplied fee)
+    // -------------------------------------------------------------------------
+
+    /// @notice Bridge USDC cross-chain to a wallet via CCTP V2, retaining `fee` USDC.
+    /// @dev User-callable. Pulls `amount` USDC from msg.sender, retains `fee` in the
+    ///      contract (sweepable by the owner via `sweep()`), and burns the remainder
+    ///      via `depositForBurnWithHook` with the caller committed as the hookData
+    ///      beneficiary.
+    ///      Like the performance fee on `rebalance` / `withdrawAndBridge` /
+    ///      `selfBatchWithdraw`, `fee` is computed off-chain and passed in rather
+    ///      than fixed on-chain. The contract only enforces `fee < amount`; the
+    ///      caller is the one paying it.
+    ///      There is no `destinationCaller` parameter: it is always zero, so anyone
+    ///      may relay the message and the mint always lands in `mintRecipient`'s
+    ///      wallet. Allowing a caller-chosen destination caller would let a user
+    ///      strand their own funds permanently, because only that address could ever
+    ///      relay and this contract's `emergencyClaimBridge` could not reach it.
+    /// @param amount               Total USDC to pull from the user (fee deducted from this).
+    /// @param fee                  USDC retained by the contract. Must be < `amount`. May be 0.
+    /// @param service              `BRIDGE_SELF_RELAY` (0) if the caller will complete the
+    ///                             destination mint, `BRIDGE_SPONSORED_RELAY` (1) if we will.
+    ///                             Recorded in `BridgeExecuted` so an indexer never has to
+    ///                             infer the arrangement from the fee or from calldata.
+    /// @param destDomain           CCTP destination domain ID (e.g. 6 = Base, 0 = Ethereum).
+    /// @param mintRecipient        Address to receive the minted USDC on the destination chain.
+    /// @param maxFee               Maximum fee the CCTP protocol may charge (0 for standard).
+    /// @param minFinalityThreshold 0 = fast finality (seconds), 2000 = standard finality (full chain finality).
+    function bridge(
+        uint256 amount,
+        uint256 fee,
+        uint8   service,
+        uint32  destDomain,
+        address mintRecipient,
+        uint256 maxFee,
+        uint32  minFinalityThreshold
+    ) external nonReentrant {
+        _validateBridge(amount, fee, service, mintRecipient);
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+
+        _bridgeBurnWithFee(amount, fee, service, destDomain, mintRecipient, maxFee, minFinalityThreshold);
+    }
+
+    /// @notice Bridge USDC cross-chain using a Permit2 signature instead of a direct approval.
+    /// @dev Identical to `bridge()` but pulls USDC via Permit2 SignatureTransfer.
+    ///      The user must have approved USDC to the canonical Permit2 contract once
+    ///      (`PERMIT2`); after that, every bridge call is authorised purely by an
+    ///      off-chain EIP-712 signature. The signed token MUST be USDC and the
+    ///      signed amount must be >= `amount`; a non-USDC token reverts (see
+    ///      `_permit2Pull`).
+    /// @param amount               Total USDC to pull from the user (fee deducted from this).
+    /// @param fee                  USDC retained by the contract. Must be < `amount`. May be 0.
+    /// @param service              `BRIDGE_SELF_RELAY` (0) if the caller will complete the
+    ///                             destination mint, `BRIDGE_SPONSORED_RELAY` (1) if we will.
+    ///                             Recorded in `BridgeExecuted` so an indexer never has to
+    ///                             infer the arrangement from the fee or from calldata.
+    /// @param destDomain           CCTP destination domain ID (e.g. 6 = Base, 0 = Ethereum).
+    /// @param mintRecipient        Address to receive the minted USDC on the destination chain.
+    /// @param maxFee               Maximum fee the CCTP protocol may charge (0 for standard).
+    /// @param minFinalityThreshold 0 = fast finality (seconds), 2000 = standard finality (full chain finality).
+    /// @param permit               Permit2 `PermitTransferFrom` payload signed by msg.sender.
+    /// @param signature            EIP-712 signature authorising the Permit2 transfer.
+    function bridgePermit2(
+        uint256 amount,
+        uint256 fee,
+        uint8   service,
+        uint32  destDomain,
+        address mintRecipient,
+        uint256 maxFee,
+        uint32  minFinalityThreshold,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external nonReentrant {
+        _validateBridge(amount, fee, service, mintRecipient);
+        _permit2Pull(permit, signature, amount);
+
+        _bridgeBurnWithFee(amount, fee, service, destDomain, mintRecipient, maxFee, minFinalityThreshold);
     }
 
     // -------------------------------------------------------------------------
