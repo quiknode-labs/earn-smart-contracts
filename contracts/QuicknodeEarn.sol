@@ -227,10 +227,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     ///         self-relay, so no funds are ever at risk.
     uint8 public constant BRIDGE_SPONSORED_RELAY = 1;
 
-    // -------------------------------------------------------------------------
-    // State
-    // -------------------------------------------------------------------------
-
     /// @notice The USDC token this contract operates on.
     IERC20  public immutable usdc;
 
@@ -258,10 +254,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     /// @notice The relayer address permitted to call `relayAndDeposit`.
     ///         Set by the owner via `setRelayer()`. May be an EOA or a contract.
     address public relayer;
-
-    // -------------------------------------------------------------------------
-    // Events
-    // -------------------------------------------------------------------------
 
     /// @notice Emitted when the executor address is updated.
     /// @param oldExecutor The previous executor address.
@@ -435,10 +427,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         uint32  minFinalityThreshold
     );
 
-    // -------------------------------------------------------------------------
-    // Errors
-    // -------------------------------------------------------------------------
-
     /// @notice Thrown when a non-executor address calls an executor-only function.
     error UnauthorizedExecutor();
 
@@ -490,10 +478,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
     /// @param amount USDC amount delivered to the beneficiary's wallet.
     event BridgeClaimed(address indexed user, uint256 amount);
 
-    // -------------------------------------------------------------------------
-    // Modifiers
-    // -------------------------------------------------------------------------
-
     /// @dev Restricts a function to the designated executor address.
     modifier onlyExecutor() {
         if (msg.sender != executor) revert UnauthorizedExecutor();
@@ -505,10 +489,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (msg.sender != relayer) revert UnauthorizedRelayer();
         _;
     }
-
-    // -------------------------------------------------------------------------
-    // Constructor
-    // -------------------------------------------------------------------------
 
     /// @notice Deploy QuicknodeEarn.
     /// @dev Sets all immutable addresses and optionally seeds the vault whitelist.
@@ -543,10 +523,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
             }
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Owner-only: Vault management
-    // -------------------------------------------------------------------------
 
     /// @notice Add a single vault to the whitelist.
     /// @dev Idempotent: re-adding an already-approved vault is a no-op (no duplicate in `vaultList`).
@@ -584,7 +560,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (!approvedVaults[vault]) revert VaultNotApproved(vault);
         approvedVaults[vault] = false;
 
-        // Remove from vaultList array (swap-and-pop, does not preserve order)
         uint256 len = vaultList.length;
         for (uint256 i = 0; i < len; i++) {
             if (vaultList[i] == vault) {
@@ -596,10 +571,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
 
         emit VaultRemoved(vault);
     }
-
-    // -------------------------------------------------------------------------
-    // Owner-only: Role management
-    // -------------------------------------------------------------------------
 
     /// @notice Set the executor address permitted to call `rebalance` and `withdrawAndBridge`.
     /// @param _executor The new executor address. Use `address(0)` to revoke.
@@ -616,10 +587,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         relayer = _relayer;
         emit RelayerUpdated(old, _relayer);
     }
-
-    // -------------------------------------------------------------------------
-    // Internal: Performance fee extraction
-    // -------------------------------------------------------------------------
 
     /// @dev Transfer fee shares from the user to this contract for each fee vault.
     ///      Every fee vault must be in `approvedVaults`.
@@ -821,10 +788,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (!success) revert CctpBurnFailed();
     }
 
-    // -------------------------------------------------------------------------
-    // Executor-only: Rebalancing
-    // -------------------------------------------------------------------------
-
     /// @notice Atomically move a user's position from one vault to another.
     /// @dev Flow:
     ///      1. Collect performance fee shares from user (may span multiple vaults).
@@ -868,17 +831,13 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         if (!approvedVaults[toVault])   revert VaultNotApproved(toVault);
         if (IERC20(toVault).allowance(user, address(this)) == 0) revert InvalidInput();
 
-        // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
 
-        // --- Withdrawal leg ---
         uint256 before = usdc.balanceOf(address(this));
         uint256 usdcReceived = _withdrawFromVault(fromVault, user, shares, deallocs, maxPenaltyShares);
 
-        // --- Deposit leg (full amount — fees already taken as shares) ---
         _depositToVault(toVault, usdcReceived, user);
 
-        // --- Return any remainder to the user ---
         uint256 remainder = usdc.balanceOf(address(this)) - before;
         if (remainder > 0) {
             usdc.safeTransfer(user, remainder);
@@ -886,10 +845,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
 
         emit Rebalanced(user, fromVault, toVault, shares, usdcReceived);
     }
-
-    // -------------------------------------------------------------------------
-    // Executor-only: Atomic withdraw + CCTP burn
-    // -------------------------------------------------------------------------
 
     /// @notice Atomically withdraw from a vault and burn USDC cross-chain via CCTP V2.
     /// @dev USDC only exists in this contract for the duration of the single transaction —
@@ -950,22 +905,15 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         bool isExit      = (mintRecipient == userB && destinationCaller == bytes32(0));
         if (!isRebalance && !isExit) revert InvalidInput();
 
-        // --- Performance fee extraction (vault shares, before withdrawal) ---
         _collectFees(user, feeVaults, feeAmounts);
 
-        // --- Withdrawal ---
         netUsdc = _withdrawFromVault(vault, user, shares, deallocs, maxPenaltyShares);
 
-        // --- CCTP burn (hookData = user, verified by relayAndDeposit on dest chain) ---
         usdc.forceApprove(tokenMessenger, netUsdc);
         _cctpBurn(netUsdc, destDomain, mintRecipient, destinationCaller, maxFee, minFinalityThreshold, user);
 
         emit BridgeInitiated(user, vault, shares, netUsdc, destDomain);
     }
-
-    // -------------------------------------------------------------------------
-    // Relayer-only: Atomic relay + deposit (single transaction)
-    // -------------------------------------------------------------------------
 
     /// @notice Atomically relay a CCTP V2 message and deposit the minted USDC into one
     ///         or more whitelisted vaults on behalf of `user`.
@@ -1101,10 +1049,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         emit StrategyCreated(msg.sender, localTotal + burnTotal);
     }
 
-    // -------------------------------------------------------------------------
-    // User-callable: Batch Deposits
-    // -------------------------------------------------------------------------
-
     /// @notice Deposit USDC from `msg.sender` into multiple vaults and optionally burn
     ///         USDC cross-chain via CCTP V2, all in one transaction.
     /// @dev User-callable (no `onlyOwner`). Uses `msg.sender` as the depositor,
@@ -1160,10 +1104,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         _permit2Pull(permit, signature, localTotal + burnTotal);
         _executeBatchDeposit(vaults, amounts, burns, localTotal, burnTotal, before);
     }
-
-    // -------------------------------------------------------------------------
-    // User-callable: Batch Withdrawal (strategy closing)
-    // -------------------------------------------------------------------------
 
     /// @notice Close all vault positions and withdraw USDC to caller.
     /// @dev User-callable (no owner required). Uses msg.sender throughout.
@@ -1271,16 +1211,11 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
 
             usdc.forceApprove(tokenMessenger, 0);
 
-            // Send any remainder to the user
             if (netUsdc > 0) {
                 usdc.safeTransfer(msg.sender, netUsdc);
             }
         }
     }
-
-    // -------------------------------------------------------------------------
-    // User-callable: Standalone CCTP Bridge (caller-supplied fee)
-    // -------------------------------------------------------------------------
 
     /// @notice Bridge USDC cross-chain to a wallet via CCTP V2, retaining `fee` USDC.
     /// @dev User-callable. Pulls `amount` USDC from msg.sender, retains `fee` in the
@@ -1357,10 +1292,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         _bridgeBurnWithFee(amount, fee, service, destDomain, mintRecipient, maxFee, minFinalityThreshold);
     }
 
-    // -------------------------------------------------------------------------
-    // User-callable: CCTP escape hatch
-    // -------------------------------------------------------------------------
-
     /// @notice Consume a pending CCTP V2 message and deliver the minted USDC straight
     ///         to the beneficiary's wallet, bypassing the vault deposit. Use when the
     ///         relayer cannot complete `relayAndDeposit` (relayer down, beneficiary
@@ -1390,10 +1321,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         emit BridgeClaimed(beneficiary, minted);
     }
 
-    // -------------------------------------------------------------------------
-    // Owner-only: Fee management
-    // -------------------------------------------------------------------------
-
     /// @notice Sweep a specific amount of an ERC20 token to the owner.
     /// @dev Use this to drain accumulated fee tokens (vault shares or USDC bridge
     ///      fees), or to recover accidentally sent tokens.
@@ -1404,10 +1331,6 @@ contract QuicknodeEarn is Ownable2Step, ReentrancyGuardTransient {
         IERC20(token).safeTransfer(owner(), amount);
         emit FeeSwept(token, owner(), amount);
     }
-
-    // -------------------------------------------------------------------------
-    // View functions
-    // -------------------------------------------------------------------------
 
     /// @notice Return the full list of currently whitelisted vault addresses.
     /// @return Array of approved vault addresses.

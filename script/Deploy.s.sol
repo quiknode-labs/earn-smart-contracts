@@ -56,10 +56,6 @@ contract DeployQuicknodeEarn is Script {
         });
     }
 
-    // -------------------------------------------------------------------------
-    // Legacy non-upgradeable QuicknodeEarn deploys
-    // -------------------------------------------------------------------------
-
     /// @notice Deploy non-upgradeable QuicknodeEarn with an explicit list of approved vaults.
     function runWithVaults(uint32 chainId, address[] calldata initialVaults) external {
         ChainConfig memory cfg = getConfig(chainId);
@@ -116,7 +112,6 @@ contract DeployQuicknodeEarn is Script {
         console.log("Deployer:   ", deployer);
         console.log("Salt (v11): version 11");
 
-        // Read approved vaults from the old contract to seed
         address[] memory initialVaults;
         if (OLD_CONTRACT.code.length > 0) {
             initialVaults = IExistingRebalancer(OLD_CONTRACT).getApprovedVaults();
@@ -150,10 +145,6 @@ contract DeployQuicknodeEarn is Script {
         console.log("Vaults:     ", rebalancer.getApprovedVaults().length);
         console.log("USDC:       ", address(rebalancer.usdc()));
     }
-
-    // -------------------------------------------------------------------------
-    // UUPS proxy deploys (initial + upgrade)
-    // -------------------------------------------------------------------------
 
     /// @notice Initial deterministic UUPS deploy of QuicknodeEarnProxy with explicit vaults.
     ///         Deploys the implementation (regular CREATE), then deploys ERC1967Proxy via
