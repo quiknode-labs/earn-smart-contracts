@@ -27,6 +27,9 @@ contract DeployQuicknodeEarn is Script {
     // CCTP V2 TokenMessenger — same deterministic address on every supported chain.
     address constant TOKEN_MESSENGER  = 0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d;
 
+    // Expected QuicknodeEarnProxy.VERSION after this upgrade. Bump with the contract.
+    uint256 constant VERSION_EXPECTED = 2;
+
     // Per-chain constructor args (immutables baked into bytecode)
     struct ChainConfig {
         address usdc;
@@ -35,55 +38,23 @@ contract DeployQuicknodeEarn is Script {
     }
 
     function getConfig(uint32 chainId) internal pure returns (ChainConfig memory) {
-        if (chainId == 1) { // Ethereum
-            return ChainConfig({
-                usdc:            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 10) { // Optimism
-            return ChainConfig({
-                usdc:            0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 130) { // Unichain
-            return ChainConfig({
-                usdc:            0x078D782b760474a361dDA0AF3839290b0EF57AD6,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 137) { // Polygon
-            return ChainConfig({
-                usdc:            0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 143) { // Monad
-            return ChainConfig({
-                usdc:            0x754704Bc059F8C67012fEd69BC8A327a5aafb603,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 8453) { // Base
-            return ChainConfig({
-                usdc:            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        } else if (chainId == 42161) { // Arbitrum
-            return ChainConfig({
-                usdc:            0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
-                msgTransmitter:  MSG_TRANSMITTER,
-                tokenMessenger:  TOKEN_MESSENGER
-            });
-        }
-        revert("Unsupported chain");
-    }
+        address usdc;
+        if      (chainId == 1)     usdc = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48; // Ethereum
+        else if (chainId == 10)    usdc = 0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85; // Optimism
+        else if (chainId == 130)   usdc = 0x078D782b760474a361dDA0AF3839290b0EF57AD6; // Unichain
+        else if (chainId == 137)   usdc = 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359; // Polygon
+        else if (chainId == 143)   usdc = 0x754704Bc059F8C67012fEd69BC8A327a5aafb603; // Monad
+        else if (chainId == 8453)  usdc = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913; // Base
+        else if (chainId == 42161) usdc = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831; // Arbitrum
+        else revert("Unsupported chain");
 
-    // -------------------------------------------------------------------------
-    // Legacy non-upgradeable QuicknodeEarn deploys
-    // -------------------------------------------------------------------------
+        // CCTP V2 uses the same deterministic addresses on every supported chain.
+        return ChainConfig({
+            usdc:           usdc,
+            msgTransmitter: MSG_TRANSMITTER,
+            tokenMessenger: TOKEN_MESSENGER
+        });
+    }
 
     /// @notice Deploy non-upgradeable QuicknodeEarn with an explicit list of approved vaults.
     function runWithVaults(uint32 chainId, address[] calldata initialVaults) external {
@@ -141,7 +112,6 @@ contract DeployQuicknodeEarn is Script {
         console.log("Deployer:   ", deployer);
         console.log("Salt (v11): version 11");
 
-        // Read approved vaults from the old contract to seed
         address[] memory initialVaults;
         if (OLD_CONTRACT.code.length > 0) {
             initialVaults = IExistingRebalancer(OLD_CONTRACT).getApprovedVaults();
@@ -175,10 +145,6 @@ contract DeployQuicknodeEarn is Script {
         console.log("Vaults:     ", rebalancer.getApprovedVaults().length);
         console.log("USDC:       ", address(rebalancer.usdc()));
     }
-
-    // -------------------------------------------------------------------------
-    // UUPS proxy deploys (initial + upgrade)
-    // -------------------------------------------------------------------------
 
     /// @notice Initial deterministic UUPS deploy of QuicknodeEarnProxy with explicit vaults.
     ///         Deploys the implementation (regular CREATE), then deploys ERC1967Proxy via
@@ -412,14 +378,19 @@ contract DeployQuicknodeEarn is Script {
         console.log("Next step:   owner calls upgradeToAndCall(newImpl, \"\") on the proxy");
     }
 
-    /// @notice Deploy a new impl and upgrade the proxy at 0xcc204B…70d2 in one broadcast.
+    /// @notice Deploy a new impl and upgrade the proxy at 0x48b415…bd8e in one broadcast.
     ///         Reverts if deployer != owner.
     function executeUpgrade(uint32 chainId) external {
         ChainConfig memory cfg = getConfig(chainId);
 
+        // The chain id is a hand-typed argument while the RPC is a separate flag.
+        // Without this, a mismatched pair bakes one chain's USDC into another
+        // chain's implementation and upgrades the live proxy to it.
+        require(block.chainid == chainId, "chainId argument does not match the RPC");
+
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer    = vm.addr(deployerKey);
-        address proxy       = 0xcc204B4cF3e796dAF4eDCFDeCfACfB1fc61F70d2;
+        address proxy       = 0x48b415841165304f7EfaA7D5dD5FC65cc7B4bd8e;
 
         require(proxy.code.length > 0, "Proxy not deployed on this chain");
 
@@ -446,7 +417,12 @@ contract DeployQuicknodeEarn is Script {
 
         vm.stopBroadcast();
 
-        // Verify state is preserved.
+        // Post-conditions, not just logs: fail loudly rather than leave a live
+        // proxy pointing at a wrong-chain implementation.
+        require(address(rebalancer.usdc()) == cfg.usdc, "usdc != chain config");
+        require(rebalancer.VERSION() == VERSION_EXPECTED, "implementation version mismatch");
+        require(rebalancer.owner() == deployer, "owner changed during upgrade");
+
         console.log("New impl:        ", address(newImpl));
         console.log("Owner (kept):    ", rebalancer.owner());
         console.log("Executor (kept): ", rebalancer.executor());
